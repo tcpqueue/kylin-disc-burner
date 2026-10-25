@@ -558,6 +558,8 @@ class MainWindow(QMainWindow):
         self.chk_verify = QCheckBox("刻录后校验（MD5）")
         self.chk_verify.setChecked(True)
         self.chk_eject = QCheckBox("完成后弹出光盘")
+        # 默认弹出：取出光盘前不用再点一次，系统下次放入时也会重新读目录
+        self.chk_eject.setChecked(True)
         ov.addWidget(self.chk_open)
         ov.addWidget(self.chk_verify)
         ov.addWidget(self.chk_eject)
@@ -1006,10 +1008,14 @@ class MainWindow(QMainWindow):
         args = B.burn_args(
             dev, [(s, d) for s, d, _z, _c in items], volid=volid,
             close=not keep_open, speed=self.cb_speed.currentData(),
-            verify=self.chk_verify.isChecked(), eject=self.chk_eject.isChecked(),
+            verify=self.chk_verify.isChecked(), eject=self._eject_after(dev),
             fixups=fixups)
         self.log.clear()
         self._run(args, self._burn_done, "正在准备刻录……", burning=True)
+
+    def _eject_after(self, dev):
+        """镜像文件没有可弹出的东西，只对光驱生效。"""
+        return self.chk_eject.isChecked() and B.is_drive(dev)
 
     def _items(self):
         return [self.tree_new.topLevelItem(i) for i in range(self.tree_new.topLevelItemCount())]
@@ -1032,7 +1038,7 @@ class MainWindow(QMainWindow):
             reason = "校验不一致，光盘数据可能有误。" if B.md5_mismatch(out) else \
                 "xorriso 返回错误（代码 %d）。" % code
             QMessageBox.critical(self, APP_NAME, "刻录失败：%s\n\n详细日志：%s" % (reason, log_path))
-        if not self.chk_eject.isChecked():
+        if not self._eject_after(self.current_dev()):
             self.refresh_media()
         else:
             self.media = B.MediaInfo()
@@ -1214,6 +1220,10 @@ def setup_app(app):
 def main():
     if hasattr(Qt, "AA_EnableHighDpiScaling"):   # Qt 5.6+
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if B.IS_WINDOWS and hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):   # Qt 5.14+
+        # Windows 常用 125%、150% 缩放。Qt 5 默认把缩放倍数四舍五入成 1 或 2 倍，
+        # 界面比系统的大或小一截；按实际倍数缩放才和其他程序一致
+        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     setup_app(app)
     # Qt 5.7 才有；麒麟 V10 2020 版是 Qt 5.6.1，没有这个接口

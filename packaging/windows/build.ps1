@@ -39,7 +39,8 @@ Write-Host "== 图标"
 & $Python "$Here\make_ico.py" "$Proj\packaging\discburner.svg" "$Work\discburner.ico"
 
 Write-Host "== PyInstaller"
-& $Python -m PyInstaller --noconfirm --clean --log-level WARN --windowed `
+# 经 pyinstaller_dpi.py 运行：在 exe 清单里声明支持高分辨率
+& $Python "$Here\pyinstaller_dpi.py" --noconfirm --clean --log-level WARN --windowed `
     --name discburner --icon "$Work\discburner.ico" `
     --add-data "$Proj\packaging\discburner.svg;." `
     --hidden-import discburner.winsys --hidden-import PyQt5.QtSvg `

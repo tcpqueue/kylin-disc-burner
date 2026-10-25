@@ -62,6 +62,7 @@ def main():
     win.show()
     wait(app, win)
 
+    assert win.chk_eject.isChecked(), "完成后弹出光盘应默认勾选"
     # 选择“ISO 镜像文件”目标（跳过文件对话框）
     win.cb_drive.insertItem(0, B.Drive(iso).label, iso)
     win.cb_drive.setCurrentIndex(0)
