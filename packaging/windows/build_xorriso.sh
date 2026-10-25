@@ -49,8 +49,8 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 cp xorriso/xorriso.exe "$OUT/"
 strip "$OUT/xorriso.exe"
 # 带上用到的 Cygwin DLL（cygwin1.dll、cygiconv-2.dll）和打过补丁的 cygcdio-19.dll
-for dll in $(PATH="$PFX/bin:$PATH" cygcheck "$OUT/xorriso.exe" | grep -iE 'cygwin64|discburner-xorriso' \
-             | grep -vi 'xorriso.exe' | sed 's/^ *//'); do
+# cygcheck 列出全部依赖，系统自带的（Windows 目录、Windows Kits 等）不带
+for dll in $(PATH="$PFX/bin:$PATH" cygcheck "$OUT/xorriso.exe" | sed 's/^ *//' | grep -i '\\cyg[^\\]*\.dll$'); do
   cp "$(cygpath -u "$dll")" "$OUT/"
 done
 "$OUT/xorriso.exe" -version 2>&1 | head -1

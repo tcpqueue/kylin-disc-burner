@@ -2,11 +2,13 @@
 
 ## 1.5.0 — 2026-10-26
 
-新增 Windows 版（绿色版 zip，Windows 10 / 11 x64）。
+新增 Windows 版（绿色版 zip，Windows 7 SP1 / 8.1 / 10 / 11，64 位）。
 
 ### Windows 版
 
 - 刻录引擎是用 Cygwin 编译的 GNU xorriso 1.5.8，通过 libcdio 直接向刻录机发命令，不依赖 Windows 的刻录服务
+- 用最后一个支持 Windows 7 的 Cygwin 3.4.10 编译，并随程序带上通用 C 运行库（UCRT），Win7 不用另装运行库
+- 打包时自动检查所有 exe / dll 的导入表，确保没有 Windows 8 以后才有的系统函数
 - 修复 libcdio 在 Cygwin 下只能识别第一个光驱的问题（装了虚拟光驱时看不到真正的刻录机）
 - 修复 libburn 的 libcdio 适配层释放光驱列表后读旧指针、偶发崩溃的问题
 - 在 Windows 上刻的文件统一设为 root 所有、文件 644、目录 755，麒麟上的普通用户也能直接打开

@@ -30,6 +30,8 @@ Windows 版和麒麟版用同一套代码、同样的刻录参数，**两边可�
 2. 解压到任意位置，例如 `D:\工具\`。不要放在层级特别深的文件夹里（完整路径超过 180 个字符时程序会打不开）；
 3. 双击 `discburner.exe`。
 
+**系统要求**：Windows 7 SP1 / 8.1 / 10 / 11，64 位。Windows 7 需要装过系统更新 KB2533623（随常规 Windows 更新一般已经装好）；程序自带通用 C 运行库，不用另装 VC 运行库。
+
 不需要安装，不写注册表（只在 `HKEY_CURRENT_USER\Software\discburner` 记住上次用的光驱）。删除文件夹就是卸载。
 
 **自检**（不需要光驱）：
@@ -62,8 +64,9 @@ discburner.exe --selftest
 | Windows 11 + USB 外置刻录机：列出光驱、读取光盘、诊断 | ✅ 实测 |
 | 往 Windows 刻的多会话 DVD+R 追加（中文名、长文件名、带单引号和空格的文件名） | ✅ 实测：MD5 校验一致，原有文件不变，资源管理器中显示正确，读出的文件与原文件逐字节一致 |
 | 自动化测试（多次追加、恢复长文件名、带“;1”的 Windows 盘追加等） | ✅ Windows 上全部通过 |
+| 用 Win7 兼容方式构建的版本（Cygwin 3.4.10）在 Windows 11 上实测刻录 | ✅ 追加刻录、MD5 校验、资源管理器读回逐字节一致 |
+| Windows 7 | ⚠️ 已按 Win7 兼容方式构建；打包时检查了全部 98 个 exe / dll 的导入表，没有 Windows 8 以后才有的系统函数；**尚未在 Win7 真机上运行** |
 | 普通用户（非管理员）账户 | ⚠️ 尚未验证。访问刻录机可能需要管理员权限 |
-| Windows 7 / 8 | ❌ 暂不支持：所用的 Cygwin 运行库从 3.5 版起不再支持 Windows 7 / 8 |
 | 32 位 Windows | ❌ 不支持 |
 
 ## 常见问题
@@ -110,6 +113,7 @@ Windows 版的界面和逻辑与麒麟版是同一套 Python 代码，平台差�
 | 误把硬盘当光驱 | libburn 遇到不认识的 `\\.\X:` 会当成普通文件读写。用 `-drive_class caution '\\\\.\\*'` 让这类地址只要不是刻录机就拒绝 |
 | 卷缓存 | 刻录后对光驱卷发 `FSCTL_DISMOUNT_VOLUME`，Windows 下次访问时重新挂载 |
 | 无控制台 | 绿色版是窗口程序，`--selftest` 的结果用对话框显示；调用 xorriso 时不弹出黑窗口 |
+| Windows 7 | Cygwin 从 3.5 版起不支持 Win7，xorriso 用 Cygwin 3.4.10 编译；Python 用 3.8（最后支持 Win7 的版本）；随程序带上 UCRT。打包脚本用 `check_win7.py` 扫描导入表把关 |
 
 ### 修复的两个上游问题
 
@@ -122,8 +126,9 @@ Windows 版的界面和逻辑与麒麟版是同一套 Python 代码，平台差�
 
 需要：
 
-- [Cygwin](https://cygwin.com/)（64 位），安装 `gcc-core make libiconv-devel pkg-config patch bzip2`；
-- Python 3.8（64 位），安装 `PyQt5==5.15.10 PyQt5-Qt5==5.15.2 pyinstaller==5.13.2`；
+- [Cygwin](https://cygwin.com/)（64 位），安装 `gcc-core make libiconv-devel pkg-config patch bzip2`。要支持 Windows 7，必须用 **Cygwin 3.4.10**（见下文）；
+- Python 3.8（64 位），安装 `PyQt5==5.15.10 PyQt5-Qt5==5.15.2 pyinstaller==5.13.2 pefile`；
+- Windows 10 SDK：打包时从里面带上通用 C 运行库（`ucrtbase.dll` 等），Windows 7 上才能运行；
 - 源码包：`xorriso-1.5.8.tar.gz`（<https://ftp.gnu.org/gnu/xorriso/>）、`libcdio-2.1.0.tar.bz2`（<https://ftp.gnu.org/gnu/libcdio/>），建议同时下载 `.sig` 校验签名。
 
 ```bat
@@ -136,6 +141,20 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 ^
 ```
 
 输出 `dist\discburner-<版本>-windows-x64.zip`。打包在系统临时目录下进行：Qt 的 DLL 层级较深，放在路径很长的目录里会超过 Windows 260 个字符的路径限制，导致界面无法启动。
+
+### 用 Cygwin 3.4.10 编译（支持 Windows 7）
+
+Cygwin 3.4.10 是最后一个支持 Windows 7 / 8 的版本，官方镜像上已经没有了，要从 Cygwin 安装页面推荐的 [Cygwin Time Machine](http://www.crouchingtigerhiddenfruitbat.org/Cygwin/timemachine.html) 安装，装到单独的目录，不影响已有的 Cygwin：
+
+```bat
+setup-x86_64.exe --quiet-mode --no-verify --root C:\cygwin-w7 --local-package-dir C:\cygwin-w7-pkgs ^
+    --only-site --site http://ctm.crouchingtigerhiddenfruitbat.org/pub/cygwin/circa/64bit/2024/01/30/231215 ^
+    --packages gcc-core,make,libiconv-devel,pkg-config,patch,bzip2,binutils
+```
+
+这个存档没有签名文件，所以要加 `--no-verify`。可以这样核对它的可信度：用 Cygwin 公钥验证当前官方镜像 `setup.ini` 的签名，再把存档 `setup.ini` 里和官方重合的包逐个比对 SHA512（本项目构建时比对了 27810 个包，全部一致）；安装程序会按存档 `setup.ini` 里的 SHA512 校验每个下载的包。
+
+然后用 `C:\cygwin-w7\bin\bash.exe` 运行 `build_xorriso.sh` 即可。
 
 源码运行（开发时）：
 
