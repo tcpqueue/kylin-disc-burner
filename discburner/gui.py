@@ -7,7 +7,7 @@ import os
 import sys
 import time
 
-from PyQt5.QtCore import QObject, QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal, qVersion
 from PyQt5.QtGui import QFont, QFontDatabase, QIcon
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
@@ -1217,13 +1217,27 @@ def setup_app(app):
         app.setWindowIcon(app_icon())
 
 
+def qt_scaling_follows_system(qt_version=None, windows=B.IS_WINDOWS):
+    """Qt 自己的高分屏缩放（AA_EnableHighDpiScaling）是否和系统设置的缩放一致。
+
+    Windows 上按系统缩放比例算，一致。X11 上 Qt 5.12 以前（麒麟 2020 版是 5.6）
+    按显示器物理 DPI 取整成 2、3 倍，和桌面设的缩放无关：4K 屏或小尺寸高分屏上
+    界面比系统和其他程序大一截。麒麟 SP1 的 Qt 5.12 按 Xft.dpi（即系统缩放）计算，
+    125%、150% 都是实际倍数。不启用时 Qt 按 Xft.dpi 放大字体，和 GTK 程序一样。
+    """
+    if windows:
+        return True
+    v = tuple(int(x) for x in (qt_version or qVersion()).split(".")[:2])
+    return v >= (5, 12)
+
+
 def main():
-    if hasattr(Qt, "AA_EnableHighDpiScaling"):   # Qt 5.6+
+    if hasattr(Qt, "AA_EnableHighDpiScaling") and qt_scaling_follows_system():   # Qt 5.6+
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    if B.IS_WINDOWS and hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):   # Qt 5.14+
-        # Windows 常用 125%、150% 缩放。Qt 5 默认把缩放倍数四舍五入成 1 或 2 倍，
-        # 界面比系统的大或小一截；按实际倍数缩放才和其他程序一致
-        QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+        if hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):   # Qt 5.14+
+            # 常用 125%、150% 缩放。Qt 5 默认把缩放倍数四舍五入成 1 或 2 倍，
+            # 界面比系统的大或小一截；按实际倍数缩放才和其他程序一致
+            QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
     setup_app(app)
     # Qt 5.7 才有；麒麟 V10 2020 版是 Qt 5.6.1，没有这个接口

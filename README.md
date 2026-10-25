@@ -152,7 +152,7 @@ D:\
 
 ```bash
 # 1. 安装（不需要联网）
-sudo dpkg -i discburner_1.4.2_arm64.deb
+sudo dpkg -i discburner_1.5.1_arm64.deb
 
 # 2. 自检（不用光驱，几秒钟），看到“自检通过”即可
 discburner --selftest ~/自检.iso

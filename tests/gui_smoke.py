@@ -63,6 +63,10 @@ def main():
     wait(app, win)
 
     assert win.chk_eject.isChecked(), "完成后弹出光盘应默认勾选"
+    # 麒麟 2020（Qt 5.6）上不能开 Qt 的高分屏缩放，SP1（5.12）和 Windows 可以
+    assert not gui.qt_scaling_follows_system("5.6.1", windows=False)
+    assert gui.qt_scaling_follows_system("5.12.12", windows=False)
+    assert gui.qt_scaling_follows_system("5.5.1", windows=True)
     # 选择“ISO 镜像文件”目标（跳过文件对话框）
     win.cb_drive.insertItem(0, B.Drive(iso).label, iso)
     win.cb_drive.setCurrentIndex(0)

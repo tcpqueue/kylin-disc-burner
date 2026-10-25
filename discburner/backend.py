@@ -1054,7 +1054,8 @@ def diagnose(dev: str) -> Diagnosis:
         if not IS_WINDOWS:
             d.kernel_bytes = kernel_capacity(dev)
     # xorriso 读不到盘片信息时（光驱被别的程序占用等）也照样识别文件系统，能识别就还能挂载
-    if (d.media.present and not d.media.blank) or             (not d.media.present and (is_drive(dev) or os.path.exists(dev))):
+    if (d.media.present and not d.media.blank) or \
+            (not d.media.present and (is_drive(dev) or os.path.exists(dev))):
         d.vrs = scan_vrs(dev)
         d.raw.append(("卷识别序列（第 16 扇区起）", " ".join(d.vrs) or "（读不到）"))
         if IS_WINDOWS:

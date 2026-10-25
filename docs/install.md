@@ -39,7 +39,7 @@ sha256sum -c SHA256SUMS --ignore-missing
 安装包**不依赖任何系统软件包**，也不需要联网，拷到机器上执行一条命令即可：
 
 ```bash
-sudo dpkg -i discburner_1.4.2_arm64.deb
+sudo dpkg -i discburner_1.5.1_arm64.deb
 ```
 
 装好后：
