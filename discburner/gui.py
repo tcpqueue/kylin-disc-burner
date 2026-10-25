@@ -1209,10 +1209,10 @@ def app_icon():
 def setup_app(app):
     app.setApplicationName(APP_NAME)
     if B.IS_WINDOWS:
-        # Qt 在中文 Windows 上默认用宋体，换成系统界面用的雅黑
+        # Qt 在中文 Windows 上默认用宋体，换成系统界面用的雅黑。9 号雅黑笔画太细，用 10 号
         for family in ("Microsoft YaHei UI", "Microsoft YaHei"):
             if family in QFontDatabase().families():
-                app.setFont(QFont(family, 9))
+                app.setFont(QFont(family, 10))
                 break
         app.setWindowIcon(app_icon())
 
@@ -1232,6 +1232,10 @@ def qt_scaling_follows_system(qt_version=None, windows=B.IS_WINDOWS):
 
 
 def main():
+    if B.IS_WINDOWS and "QT_QPA_PLATFORM" not in os.environ:
+        # Qt 在 Windows 上默认用 GDI 画字，中文笔画又细又淡，看着发虚；
+        # FreeType 会加深笔画，中文清楚得多。设了 QT_QPA_PLATFORM 时以设置的为准
+        os.environ["QT_QPA_PLATFORM"] = "windows:fontengine=freetype"
     if hasattr(Qt, "AA_EnableHighDpiScaling") and qt_scaling_follows_system():   # Qt 5.6+
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         if hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):   # Qt 5.14+
