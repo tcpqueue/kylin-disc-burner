@@ -105,11 +105,11 @@ def xpath(path: str) -> str:
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 if IS_WINDOWS:
-    # 绿色版：xorriso 目录和主程序放在一起；源码运行时放在项目目录下
+    # 单文件版：运行时解压到临时目录（sys._MEIPASS）；绿色版：xorriso 目录和主程序放在一起；
+    # 源码运行时放在项目目录下
     BUNDLED_XORRISO = [
-        os.path.join(os.path.dirname(sys.executable), "xorriso", "xorriso.exe"),
-        os.path.join(_APP_DIR, "xorriso", "xorriso.exe"),
-    ]
+        os.path.join(d, "xorriso", "xorriso.exe")
+        for d in (getattr(sys, "_MEIPASS", None), os.path.dirname(sys.executable), _APP_DIR) if d]
 else:
     # 安装包自带的 xorriso（GNU xorriso 独立版，按 Ubuntu 16.04 / glibc 2.23 编译）
     BUNDLED_XORRISO = [

@@ -138,7 +138,7 @@ D:\
 |---|---|---|
 | 国产 ARM 终端 | 飞腾 D2000 / D3000 / FT-2000/4、鲲鹏等 | `discburner_<版本>_arm64.deb` |
 | x86 终端 | 兆芯、海光、Intel、AMD | `discburner_<版本>_amd64.deb` |
-| Windows 7 SP1 / 8.1 / 10 / 11 电脑 | 64 位 | [`discburner-<版本>-windows-x64.zip`](https://github.com/tcpqueue/kylin-disc-burner/releases?q=windows)（绿色版，解压即用） |
+| Windows 7 SP1 / 8.1 / 10 / 11 电脑 | 64 位 | [`discburner-<版本>-portable.exe`](https://github.com/tcpqueue/kylin-disc-burner/releases?q=windows)（单文件版，双击即用）<br>或 `discburner-<版本>-windows-x64.zip`（绿色版，解压即用） |
 
 不确定是哪种？在终端运行 `dpkg --print-architecture`，输出 `arm64` 或 `amd64`。
 

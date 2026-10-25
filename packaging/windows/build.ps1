@@ -1,4 +1,4 @@
-﻿# 打 Windows 绿色版（zip）。
+﻿# 打 Windows 版：绿色版（zip，解压即用）和单文件版（一个 exe）。
 #
 #   powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 `
 #       -Python C:\discburner-build\venv38\Scripts\python.exe `
@@ -11,6 +11,7 @@
 #   -Work     临时目录。要用短路径：Qt 的 DLL 层级深，整条路径超过 260 个字符就加载不了
 #
 # 输出：dist\discburner-<版本>-windows-x64.zip
+#       dist\discburner-<版本>-portable.exe（单文件版，运行时自动解压到临时目录）
 param(
     [Parameter(Mandatory = $true)][string]$Python,
     [Parameter(Mandatory = $true)][string]$Xorriso,
@@ -38,15 +39,33 @@ Remove-Item Env:\DISCBURNER_XORRISO
 Write-Host "== 图标"
 & $Python "$Here\make_ico.py" "$Proj\packaging\discburner.svg" "$Work\discburner.ico"
 
-Write-Host "== PyInstaller"
-# 经 pyinstaller_dpi.py 运行：在 exe 清单里声明支持高分辨率
-& $Python "$Here\pyinstaller_dpi.py" --noconfirm --clean --log-level WARN --windowed `
-    --name discburner --icon "$Work\discburner.ico" `
-    --add-data "$Proj\packaging\discburner.svg;." `
-    --hidden-import discburner.winsys --hidden-import PyQt5.QtSvg `
-    --exclude-module tkinter --exclude-module unittest --exclude-module pydoc `
-    --paths $Proj --distpath "$Work\dist" --workpath "$Work\pyi" --specpath $Work `
-    "$Proj\packaging\run.py"
+# 两种打包共用的 PyInstaller 参数。经 pyinstaller_dpi.py 运行：在 exe 清单里声明支持高分辨率
+$PyiArgs = @("--noconfirm", "--clean", "--log-level", "WARN", "--windowed",
+    "--icon", "$Work\discburner.ico", "--add-data", "$Proj\packaging\discburner.svg;.",
+    "--hidden-import", "discburner.winsys", "--hidden-import", "PyQt5.QtSvg",
+    "--exclude-module", "tkinter", "--exclude-module", "unittest", "--exclude-module", "pydoc",
+    "--paths", $Proj, "--specpath", $Work)
+
+function Test-Exe($exe, $tag) {
+    Write-Host "== $tag：自检"
+    $out = Join-Path $Work "selftest-$tag.txt"
+    $env:DISCBURNER_SELFTEST_OUT = $out
+    Start-Process $exe -ArgumentList "--selftest" -Wait
+    Remove-Item Env:\DISCBURNER_SELFTEST_OUT
+    $text = Get-Content -Raw -Encoding UTF8 $out
+    Write-Host $text
+    if ($text -notmatch "自检通过") { throw "$tag 自检失败" }
+    Write-Host "== $tag：界面启动"
+    $shot = Join-Path $Work "screenshot-$tag.png"
+    $env:DISCBURNER_SCREENSHOT = $shot
+    Start-Process $exe -Wait
+    Remove-Item Env:\DISCBURNER_SCREENSHOT
+    if (-not (Test-Path $shot)) { throw "$tag 界面没有启动" }
+}
+
+Write-Host "== PyInstaller（绿色版）"
+& $Python "$Here\pyinstaller_dpi.py" @PyiArgs --name discburner `
+    --distpath "$Work\dist" --workpath "$Work\pyi" "$Proj\packaging\run.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller 失败" }
 
 $App = Join-Path $Work $Name
@@ -81,29 +100,15 @@ cygiconv-2.dll   GNU libiconv（LGPL），未修改
                  官方镜像只保留最新几个版本；3.4.x 等旧版本在 Cygwin Time Machine 存档里：
                  http://www.crouchingtigerhiddenfruitbat.org/Cygwin/timemachine.html
 
-编译方法见 build_xorriso.sh。
+编译方法见 build_xorriso.sh。源码和补丁都在绿色版 zip 的 source 目录里，
+也可以在项目主页取得：https://github.com/tcpqueue/kylin-disc-burner
 "@ | Set-Content -Encoding UTF8 (Join-Path $SrcOut "SOURCES.txt")
 
 Write-Host "== Windows 7 兼容检查"
 & $Python "$Here\check_win7.py" $App
 if ($LASTEXITCODE -ne 0) { throw "有 Windows 8 以后才有的系统函数：xorriso 要用 Cygwin 3.4.10 编译，见 docs\windows.md" }
 
-Write-Host "== 打包后自检"
-$exe = Join-Path $App "discburner.exe"
-$out = Join-Path $Work "selftest.txt"
-$env:DISCBURNER_SELFTEST_OUT = $out
-Start-Process $exe -ArgumentList "--selftest" -Wait
-Remove-Item Env:\DISCBURNER_SELFTEST_OUT
-$text = Get-Content -Raw -Encoding UTF8 $out
-Write-Host $text
-if ($text -notmatch "自检通过") { throw "自检失败" }
-
-Write-Host "== 界面启动"
-$shot = Join-Path $Work "screenshot.png"
-$env:DISCBURNER_SCREENSHOT = $shot
-Start-Process $exe -Wait
-Remove-Item Env:\DISCBURNER_SCREENSHOT
-if (-not (Test-Path $shot)) { throw "界面没有启动" }
+Test-Exe (Join-Path $App "discburner.exe") "绿色版"
 
 Write-Host "== zip"
 $zip = Join-Path $Dist "$Name-x64.zip"
@@ -120,3 +125,18 @@ with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as z:
 "@ $App $zip
 $size = "{0:N1} MB" -f ((Get-Item $zip).Length / 1MB)
 Write-Host "已生成 $zip（$size）"
+
+Write-Host "== PyInstaller（单文件版）"
+# xorriso 和许可证、源码说明一起打进 exe，运行时解压到临时目录（sys._MEIPASS）
+& $Python "$Here\pyinstaller_dpi.py" @PyiArgs --onefile --name "discburner-$Version-portable" `
+    --add-binary "$Xorriso\*;xorriso" `
+    --add-data "$Proj\LICENSE;." --add-data "$SrcOut\SOURCES.txt;." `
+    --distpath "$Work\dist1" --workpath "$Work\pyi1" "$Proj\packaging\run.py"
+if ($LASTEXITCODE -ne 0) { throw "PyInstaller（单文件版）失败" }
+$one = Join-Path $Work "dist1\discburner-$Version-portable.exe"
+& $Python "$Here\check_win7.py" (Join-Path $Work "dist1")
+if ($LASTEXITCODE -ne 0) { throw "单文件版有 Windows 8 以后才有的系统函数" }
+Test-Exe $one "单文件版"
+Copy-Item $one $Dist -Force
+$size = "{0:N1} MB" -f ((Get-Item $one).Length / 1MB)
+Write-Host "已生成 $(Join-Path $Dist (Split-Path -Leaf $one))（$size）"

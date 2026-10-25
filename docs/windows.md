@@ -26,9 +26,17 @@ Windows 版和麒麟版用同一套代码、同样的刻录参数，**两边可�
 
 ## 下载和运行
 
-1. 从 [Releases](https://github.com/tcpqueue/kylin-disc-burner/releases?q=windows) 下载 `discburner-<版本>-windows-x64.zip`；
-2. 解压到任意位置，例如 `D:\工具\`。不要放在层级特别深的文件夹里（完整路径超过 180 个字符时程序会打不开）；
-3. 双击 `discburner.exe`。
+从 [Releases](https://github.com/tcpqueue/kylin-disc-burner/releases?q=windows) 下载，有两种形式，功能完全一样：
+
+| | 单文件版 | 绿色版 |
+|---|---|---|
+| 文件 | `discburner-<版本>-portable.exe`（约 40 MB） | `discburner-<版本>-windows-x64.zip`（约 42 MB） |
+| 用法 | 拷到任意位置，双击即可 | 解压到任意位置，双击里面的 `discburner.exe` |
+| 启动速度 | 每次启动先解压到临时目录，要多等几秒 | 快 |
+| 适合 | 拷到 U 盘随身带、发给别人 | 经常使用的电脑 |
+| 源码和许可证 | 打在 exe 里；源码包见绿色版 zip 或项目主页 | 在 `source\`、`LICENSE.txt` |
+
+绿色版不要解压到层级特别深的文件夹里（完整路径超过 180 个字符时程序会打不开）。单文件版个别杀毒软件可能误报（运行时解压程序是这类工具的通病），添加信任即可。
 
 **系统要求**：Windows 7 SP1 / 8.1 / 10 / 11，64 位。Windows 7 需要装过系统更新 KB2533623（随常规 Windows 更新一般已经装好）；程序自带通用 C 运行库，不用另装 VC 运行库。
 
@@ -140,7 +148,7 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build.ps1 ^
     -Python C:\build\venv38\Scripts\python.exe -Xorriso C:\build\xorriso -Src C:\build\src
 ```
 
-输出 `dist\discburner-<版本>-windows-x64.zip`。打包在系统临时目录下进行：Qt 的 DLL 层级较深，放在路径很长的目录里会超过 Windows 260 个字符的路径限制，导致界面无法启动。
+输出 `dist\discburner-<版本>-windows-x64.zip` 和 `dist\discburner-<版本>-portable.exe`，两种都会自动跑自检和界面启动测试。打包在系统临时目录下进行：Qt 的 DLL 层级较深，放在路径很长的目录里会超过 Windows 260 个字符的路径限制，导致界面无法启动。
 
 ### 用 Cygwin 3.4.10 编译（支持 Windows 7）
 
