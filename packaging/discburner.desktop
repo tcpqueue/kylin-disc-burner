@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Disc Burner
+Name[zh_CN]=光盘刻录助手
+Comment=Burn data discs that Windows reads correctly and stay appendable
+Comment[zh_CN]=刻录 Windows 可正常显示中文名、可多次追加的数据光盘
+Exec=discburner
+Icon=discburner
+Terminal=false
+Categories=Utility;DiscBurning;Qt;
+Keywords=burn;cd;dvd;bd;iso;刻录;光盘;
+StartupNotify=true

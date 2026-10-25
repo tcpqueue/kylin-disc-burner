@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.iso
+dist/
+test-output/
+build/
+*.spec
