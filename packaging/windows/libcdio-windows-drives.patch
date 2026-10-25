@@ -1,0 +1,22 @@
+--- a/lib/driver/_cdio_generic.c
++++ b/lib/driver/_cdio_generic.c
+@@ -242,9 +242,18 @@
+     unsigned int j;
+     char real_device_1[PATH_MAX];
+     char real_device_2[PATH_MAX];
+-    cdio_realpath(drive, real_device_1);
++    /* Windows device names like \\.\G: have no meaningful realpath; under
++       Cygwin they all resolve to the same string and every drive after the
++       first one got dropped. Compare such names literally. */
++    int is_win_dev = strncmp(drive, "\\\\.\\", 4) == 0;
++    if (!is_win_dev)
++      cdio_realpath(drive, real_device_1);
+     /* Check if drive is already in list. */
+     for (j=0; j<*num_drives; j++) {
++      if (is_win_dev) {
++        if (strcmp(drive, (*device_list)[j]) == 0) break;
++        continue;
++      }
+       cdio_realpath((*device_list)[j], real_device_2);
+       if (strcmp(real_device_1, real_device_2) == 0) break;
+     }

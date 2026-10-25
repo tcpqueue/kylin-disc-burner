@@ -57,6 +57,7 @@ def main():
     iso = os.path.join(tmp, "光盘.iso")
 
     app = QApplication(sys.argv)
+    gui.setup_app(app)
     win = gui.MainWindow()
     win.show()
     wait(app, win)
@@ -108,7 +109,7 @@ def main():
                    "Media status : is written , is appendable , but next track is damaged\n"
                    "Media blocks :    20000 readable ,  2200000 writable ,  2295104 overall\n"
                    "Other session:   1 ,         0 ,     20000s ,\n")
-    fake_dev = "/dev/sr9"
+    fake_dev = B.windows_dev("Y") if B.IS_WINDOWS else "/dev/sr9"
     win.cb_drive.insertItem(0, "测试光驱 (%s)" % fake_dev, fake_dev)
     win.cb_drive.setCurrentIndex(0)
     real_repair_args = B.repair_args
@@ -175,10 +176,10 @@ def main():
     long_name = "2023年度《办公设备管理制度》相关表格.xls"
     with open(os.path.join(src, long_name), "w") as f:
         f.write("x")
-    B.run_xorriso(B.COMMON_ARGS + ["-joliet", "off", "-dev", short_iso,
-                                   "-map", os.path.join(src, long_name), "/" + long_name, "-commit"])
+    B.run_xorriso(B.COMMON_ARGS + ["-joliet", "off", "-dev", B.xpath(short_iso),
+                                   "-map", B.xpath(os.path.join(src, long_name)), "/" + long_name, "-commit"])
     B.run_xorriso(B.COMMON_ARGS + ["-read_fs", "ecma119", "-rockridge", "off", "-joliet", "on",
-                                   "-dev", short_iso, "-map", os.path.join(src, "工作报告.docx"),
+                                   "-dev", B.xpath(short_iso), "-map", B.xpath(os.path.join(src, "工作报告.docx")),
                                    "/NEW.DOC", "-commit"])
     win.cb_drive.insertItem(0, B.Drive(short_iso).label, short_iso)
     win.cb_drive.setCurrentIndex(0)

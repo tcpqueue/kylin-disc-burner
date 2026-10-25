@@ -1,0 +1,12 @@
+--- a/libburn/sg-libcdio.c
++++ b/libburn/sg-libcdio.c
+@@ -249,6 +249,9 @@
+ 			if (*(idx->ppsz_cd_drives) != NULL)
+ 				cdio_free_device_list(idx->ppsz_cd_drives);
+ 		idx->ppsz_cd_drives = NULL;
++		/* idx->pos pointed into the list just freed */
++		idx->pos = NULL;
++		return 0;
+ 	}
+ 
+ #ifdef Libburn_guess_freebsd_atapi_devicE

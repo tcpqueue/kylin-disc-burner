@@ -11,6 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/tcpqueue/kylin-disc-burner?style=flat-square&color=2b7bd6)](https://github.com/tcpqueue/kylin-disc-burner/releases/latest)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue?style=flat-square)](LICENSE)
 [![Platform](https://img.shields.io/badge/Kylin%20V10-2020%20%7C%20SP1-c4161c?style=flat-square)](#兼容性)
+[![Windows](https://img.shields.io/badge/Windows-10%20%7C%2011-0078d4?style=flat-square)](docs/windows.md)
 [![Arch](https://img.shields.io/badge/arch-arm64%20%7C%20amd64-555?style=flat-square)](#下载)
 [![Backend](https://img.shields.io/badge/backend-xorriso%201.5.8-6a4c9c?style=flat-square)](https://www.gnu.org/software/xorriso/)
 
@@ -137,8 +138,15 @@ D:\
 |---|---|---|
 | 国产 ARM 终端 | 飞腾 D2000 / D3000 / FT-2000/4、鲲鹏等 | `discburner_<版本>_arm64.deb` |
 | x86 终端 | 兆芯、海光、Intel、AMD | `discburner_<版本>_amd64.deb` |
+| Windows 10 / 11 电脑 | x64 | [`discburner-<版本>-windows-x64.zip`](https://github.com/tcpqueue/kylin-disc-burner/releases?q=windows)（绿色版，解压即用） |
 
 不确定是哪种？在终端运行 `dpkg --print-architecture`，输出 `arm64` 或 `amd64`。
+
+### Windows 版
+
+办公室里麒麟和 Windows 电脑往往混着用，同一张光盘在两边来回追加。Windows 自带的刻录往麒麟刻的盘里追加时会把文件名写成 `2023__~1.XLS` 这样的短名，Windows 版就是为这种情况准备的：刻出来的盘在两边都显示完整的中文名，可以和麒麟版交替追加。详见 [Windows 版说明](docs/windows.md)。
+
+<p align="center"><img src="docs/images/windows.png" width="620" alt="Windows 版"></p>
 
 ## 快速开始
 
@@ -186,6 +194,7 @@ discburner --selftest ~/自检.iso
 | [技术原理](docs/principles.md) | 乱码与封盘的根因分析、Joliet、多会话、xorriso 版本问题、UDF 支持 |
 | [开发与构建](docs/development.md) | 代码结构、测试、从源码构建离线安装包 |
 | [常见问题](docs/faq.md) | 与 Windows 混用、光盘选择、故障排查 |
+| [Windows 版说明](docs/windows.md) | Windows 绿色版的用法、与麒麟版的区别、构建方法 |
 | [更新日志](CHANGELOG.md) | 版本历史 |
 
 ## 验证情况
@@ -201,6 +210,8 @@ discburner --selftest ~/自检.iso
 | 检测未关闭会话 | ✅ 基于真实光驱输出 |
 | 关闭未关闭会话（修复） | ⚠️ 尚未在真实的未关闭光盘上验证 |
 | 飞腾真机 | ⚠️ 尚未验证 |
+| Windows 版：真实光驱读取、追加刻录、MD5 校验、资源管理器核对 | ✅ Windows 11 + USB 刻录机实测 |
+| Windows 版：普通用户（非管理员）账户、Windows 7 | ⚠️ 尚未验证 / 暂不支持 |
 
 首次在新机器上使用，建议先用一张可擦写盘或便宜的 DVD+R 试刻。遇到问题欢迎[提交 Issue](https://github.com/tcpqueue/kylin-disc-burner/issues)，附上“光盘诊断 → 复制诊断报告”的内容会很有帮助。
 

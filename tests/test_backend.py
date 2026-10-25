@@ -16,6 +16,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from discburner import backend as B  # noqa: E402
 
+# 拼参数时用的光驱地址（Windows 版是 \\.\G: 这种形式）
+DEV = B.windows_dev("G") if B.IS_WINDOWS else "/dev/sr0"
+
+
+def have_xorriso():
+    try:
+        return bool(B.find_xorriso())
+    except B.XorrisoNotFound:
+        return False
+
 TOC_BLANK = """\
 Drive current: -dev '/dev/sr0'
 Drive type   : vendor 'HL-DT-ST' product 'DVDRAM GP65NB60' revision 'PF00'
@@ -208,7 +218,7 @@ class DiagParseTests(unittest.TestCase):
         self.assertEqual(B._unescape_mount("/media/u/My\\040Disc"), "/media/u/My Disc")
 
     def test_conclusions(self):
-        d = B.Diagnosis("/dev/sr0")
+        d = B.Diagnosis(DEV)
         d.media = B.parse_toc(TOC_DAMAGED)
         self.assertEqual(B._conclude(d)[0][0], B.ERROR)
         d.media = B.parse_toc(TOC_FOREIGN)
@@ -225,6 +235,46 @@ class DiagParseTests(unittest.TestCase):
         d.fs, d.vrs = {"type": "iso9660", "version": ""}, ["CD001"]
         d.fs_text = B.describe_fs(d.fs, d.vrs)
         self.assertEqual(B._conclude(d)[0][0], B.WARN)   # 没有 Joliet
+
+
+class PlatformTests(unittest.TestCase):
+    """Windows 版用到的路径转换和参数文件，纯字符串处理，任何平台都能测。"""
+
+    def test_cygwin_path(self):
+        self.assertEqual(B.cygwin_path(r"C:\Users\张三\资料.docx"), "/cygdrive/c/Users/张三/资料.docx")
+        self.assertEqual(B.cygwin_path("D:\\"), "/cygdrive/d/")
+        self.assertEqual(B.cygwin_path("D:"), "/cygdrive/d/")
+        self.assertEqual(B.cygwin_path(r"\\server\share\a.txt"), "//server/share/a.txt")
+        self.assertEqual(B.drive_letter(B.windows_dev("g")), "G")
+        self.assertEqual(B.drive_letter("/dev/sr0"), "")
+
+    def test_options_file(self):
+        args = ["-abort_on", "FAILURE", "-dev", "/x.iso", "-volid", "资料盘",
+                "-map", "/cygdrive/c/it's 文件 (1).txt", "/it's 文件 (1).txt",
+                "-find", "/a", "-type", "d", "-exec", "chmod", "0755", "--",
+                "-file_size_limit", "off", "--", "-commit"]
+        lines = B.options_file_text(args).splitlines()
+        self.assertEqual(lines[0], "'-abort_on' 'FAILURE'")
+        self.assertEqual(lines[3], "'-map' '/cygdrive/c/it'\"'\"'s 文件 (1).txt' '/it'\"'\"'s 文件 (1).txt'")
+        self.assertEqual(lines[4], "'-find' '/a' '-type' 'd' '-exec' 'chmod' '0755' '--'")
+        self.assertEqual(lines[5], "'-file_size_limit' 'off' '--'")
+        self.assertEqual(lines[-1], "'-commit'")
+        with self.assertRaises(ValueError):
+            B.options_file_text(["-map", "/" + "长" * 8000, "/x"])
+
+    def test_windows_perm_args(self):
+        s = " ".join(B.windows_perm_args(["/资料"]))
+        self.assertIn("-chown_r 0 /资料 --", s)
+        self.assertIn("-find /资料 -type d -exec chmod 0755 --", s)
+        self.assertIn("-find /资料 -type f -exec chmod 0644 --", s)
+
+    def test_virtual_drives_last(self):
+        d = B.sort_drives([B.Drive("a", "EZBSYS", "ISO CDVD DRIVE"), B.Drive("b", "Verbatim", "66807"),
+                           B.Drive("c", "Msft", "Virtual DVD-ROM")])
+        self.assertEqual([x.dev for x in d], ["b", "a", "c"])
+
+    def test_volid_dash(self):
+        self.assertIsNotNone(B.check_volid("-commit"))
 
 
 class ShortNameTests(unittest.TestCase):
@@ -249,17 +299,17 @@ class ShortNameTests(unittest.TestCase):
         self.assertEqual([(r.old, r.new) for r in f], [("/a.docx;1", "/a.docx"), ("/目录/c.txt;1", "/目录/c.txt")])
         self.assertEqual(B.version_fixups(["/a.docx", "/b"]), [])
         self.assertEqual(B.version_fixups(["/a;1"], skip={"/a;1"}), [])
-        s = " ".join(B.burn_args("/dev/sr0", [("/x", "/x")], fixups=f))
+        s = " ".join(B.burn_args(DEV, [("/x", "/x")], fixups=f))
         self.assertIn("-move /a.docx;1 /a.docx", s)
         self.assertLess(s.index("-move"), s.index("-map"))
 
     def test_rename_args(self):
-        a = B.rename_args("/dev/sr0", [B.Rename("/A__~1.XLS", "/原名.xls", 0)])
+        a = B.rename_args(DEV, [B.Rename("/A__~1.XLS", "/原名.xls", 0)])
         s = " ".join(a)
         self.assertIn("-move /A__~1.XLS /原名.xls -commit", s)
         self.assertIn("-close off", s)
         self.assertLess(a.index("-joliet"), a.index("-dev"))
-        a = B.rename_args("/dev/sr0", [], speed="min")
+        a = B.rename_args(DEV, [], speed="min")
         self.assertLess(a.index("-dev"), a.index("-speed"))
         self.assertEqual(a[a.index("-speed") + 1], "min")
 
@@ -366,12 +416,12 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(B.indev_failed(INDEV_FAILED))
         self.assertTrue(B.parse_toc(INDEV_FAILED).tree_unreadable)
         self.assertFalse(B.parse_toc(INDEV_FAILED).present)
-        s = " ".join(B.outdev_toc_args("/dev/sr0"))
-        self.assertIn("-drive_access shared:readonly -outdev /dev/sr0 -toc", s)
+        s = " ".join(B.outdev_toc_args(DEV))
+        self.assertIn("-drive_access shared:readonly -outdev %s -toc" % DEV, s)
 
     def test_repair_force(self):
-        self.assertIn("-close_damaged force", " ".join(B.repair_args("/dev/sr0", force=True)))
-        self.assertIn("-close_damaged as_needed", " ".join(B.repair_args("/dev/sr0")))
+        self.assertIn("-close_damaged force", " ".join(B.repair_args(DEV, force=True)))
+        self.assertIn("-close_damaged as_needed", " ".join(B.repair_args(DEV)))
 
     def test_diagnose_falls_back_to_outdev(self):
         """-indev 失败时诊断改用 -outdev，并给出“需要修复”的结论，而不是“没有光盘”。"""
@@ -413,9 +463,9 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(m.incomplete and m.needs_repair)
 
     def test_repair_args(self):
-        s = " ".join(B.repair_args("/dev/sr0"))
-        self.assertIn("-outdev /dev/sr0 -close off -close_damaged as_needed", s)
-        self.assertIn("-close on", " ".join(B.repair_args("/dev/sr0", keep_open=False)))
+        s = " ".join(B.repair_args(DEV))
+        self.assertIn("-outdev %s -close off -close_damaged as_needed" % DEV, s)
+        self.assertIn("-close on", " ".join(B.repair_args(DEV, keep_open=False)))
 
     def test_repair_result(self):
         self.assertEqual(B.repair_result(0, "libburn : NOTE : Track not marked as damaged. No action taken."),
@@ -461,21 +511,21 @@ class ParseTests(unittest.TestCase):
         self.assertIsNotNone(B.check_volid("A" * 17))
 
     def test_burn_args(self):
-        a = B.burn_args("/dev/sr0", [("/home/u/报告.docx", "/报告.docx")], volid="X")
+        a = B.burn_args(DEV, [("/home/u/报告.docx", "/报告.docx")], volid="X")
         s = " ".join(a)
         self.assertLess(a.index("-joliet"), a.index("-dev"))
         self.assertIn("-close off", s)
         self.assertIn("-local_charset UTF-8", s)
         self.assertIn("joliet_long_names", s)
         self.assertIn("-check_md5_r FAILURE /报告.docx --", s)
-        self.assertIn("-close on", " ".join(B.burn_args("/dev/sr0", [], close=True)))
+        self.assertIn("-close on", " ".join(B.burn_args(DEV, [], close=True)))
 
     def test_disc_join(self):
         self.assertEqual(B.disc_join("/", "a.txt"), "/a.txt")
         self.assertEqual(B.disc_join("备份/2025/", "a.txt"), "/备份/2025/a.txt")
 
 
-@unittest.skipUnless(shutil.which("xorriso"), "需要 xorriso")
+@unittest.skipUnless(have_xorriso(), "需要 xorriso")
 class IntegrationTests(unittest.TestCase):
     """对 ISO 文件模拟“第一次刻录 → 追加 → 读回”的完整流程。"""
 
@@ -486,6 +536,7 @@ class IntegrationTests(unittest.TestCase):
         self._w("工作报告.docx", "a")
         self._w("项目资料/会议纪要 第三次.doc", "b" * 5000)
         self._w("长" * 80 + ".txt", "c")
+        self._w("it's 文件 (1).txt", "d")
         self.iso = os.path.join(self.tmp, "disc.iso")
 
     def tearDown(self):
@@ -502,7 +553,8 @@ class IntegrationTests(unittest.TestCase):
 
     def test_multisession_roundtrip(self):
         self._burn([(os.path.join(self.src, "工作报告.docx"), "/工作报告.docx"),
-                    (os.path.join(self.src, "项目资料"), "/项目资料")],
+                    (os.path.join(self.src, "项目资料"), "/项目资料"),
+                    (os.path.join(self.src, "it's 文件 (1).txt"), "/it's 文件 (1).txt")],
                    volid="资料盘2025")
         m = B.read_media(self.iso)
         self.assertTrue(m.appendable, m.raw)
@@ -519,6 +571,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("/工作报告.docx", files)
         self.assertIn("/项目资料/会议纪要 第三次.doc", files)
         self.assertIn("/追加/" + name, files)
+        self.assertIn("/it's 文件 (1).txt", files)
 
     def test_close_disc(self):
         self._burn([(os.path.join(self.src, "工作报告.docx"), "/a.docx")], close=True)
@@ -536,7 +589,7 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(f.read(), before)
         self.assertFalse(B.read_media(self.iso).needs_repair)
 
-    @unittest.skipUnless(B.find_tool("blkid"), "需要 blkid")
+    @unittest.skipUnless(B.IS_WINDOWS or B.find_tool("blkid"), "需要 blkid")
     def test_diagnose_iso(self):
         self._burn([(os.path.join(self.src, "工作报告.docx"), "/a.docx")], volid="资料盘")
         self._burn([(os.path.join(self.src, "项目资料"), "/项目资料")])
@@ -560,6 +613,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(d.fs.get("type"), "udf", d.report_text())
         self.assertEqual(d.fs_text, "UDF 2.01")
         self.assertEqual(d.vrs, ["BEA01", "NSR03", "TEA01"])
+        self.assertEqual(B.udf_revision(img), "2.01")
         self.assertTrue(any("UDF" in t for _, t in d.findings))
 
     def make_short_name_disc(self):
@@ -568,14 +622,14 @@ class IntegrationTests(unittest.TestCase):
         names = ["2023年度《办公设备管理制度》相关表格.xls", "部门通讯录（内部）.xlsx"]
         for n in names:
             self._w(n, n)
-        args = B.COMMON_ARGS + ["-joliet", "off", "-dev", self.iso]
+        args = B.COMMON_ARGS + ["-joliet", "off", "-dev", B.xpath(self.iso)]
         for n in names:
-            args += ["-map", os.path.join(self.src, n), "/" + n]
+            args += ["-map", B.xpath(os.path.join(self.src, n)), "/" + n]
         code, out = B.run_xorriso(args + ["-commit"])
         self.assertEqual(code, 0, out)
         code, out = B.run_xorriso(B.COMMON_ARGS + [
-            "-read_fs", "ecma119", "-rockridge", "off", "-joliet", "on", "-dev", self.iso,
-            "-map", os.path.join(self.src, "工作报告.docx"), "/NEW.DOC", "-commit"])
+            "-read_fs", "ecma119", "-rockridge", "off", "-joliet", "on", "-dev", B.xpath(self.iso),
+            "-map", B.xpath(os.path.join(self.src, "工作报告.docx")), "/NEW.DOC", "-commit"])
         self.assertEqual(code, 0, out)
         return names
 
@@ -593,8 +647,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(files, {"/" + n for n in names} | {"/NEW.DOC"})
         # 再诊断：没有短名了，内容也没变
         self.assertEqual(B.diagnose(self.iso).short_names, [])
-        code, out = B.run_xorriso(B.COMMON_ARGS + ["-indev", self.iso, "-osirrox", "on",
-                                                   "-extract", "/" + names[0], os.path.join(self.tmp, "x")])
+        code, out = B.run_xorriso(B.COMMON_ARGS + ["-indev", B.xpath(self.iso), "-osirrox", "on",
+                                                   "-extract", "/" + names[0], B.xpath(os.path.join(self.tmp, "x"))])
         with open(os.path.join(self.tmp, "x"), encoding="utf-8") as f:
             self.assertEqual(f.read(), names[0])
 
@@ -603,13 +657,13 @@ class IntegrationTests(unittest.TestCase):
         names = ["空文件甲.txt", "空文件乙.txt", "有内容的文件.txt"]
         for n in names:
             self._w(n, "" if n.startswith("空") else "data")
-        args = B.COMMON_ARGS + ["-joliet", "off", "-dev", self.iso]
+        args = B.COMMON_ARGS + ["-joliet", "off", "-dev", B.xpath(self.iso)]
         for n in names:
-            args += ["-map", os.path.join(self.src, n), "/" + n]
+            args += ["-map", B.xpath(os.path.join(self.src, n)), "/" + n]
         self.assertEqual(B.run_xorriso(args + ["-commit"])[0], 0)
         code, out = B.run_xorriso(B.COMMON_ARGS + [
-            "-read_fs", "ecma119", "-rockridge", "off", "-joliet", "on", "-dev", self.iso,
-            "-map", os.path.join(self.src, "工作报告.docx"), "/NEW.DOC", "-commit"])
+            "-read_fs", "ecma119", "-rockridge", "off", "-joliet", "on", "-dev", B.xpath(self.iso),
+            "-map", B.xpath(os.path.join(self.src, "工作报告.docx")), "/NEW.DOC", "-commit"])
         self.assertEqual(code, 0, out)
         plan = B.plan_name_recovery(self.iso)
         self.assertEqual([os.path.basename(r.new) for r in plan.renames], ["有内容的文件.txt"])
@@ -643,7 +697,7 @@ class IntegrationTests(unittest.TestCase):
         """Windows 刻的盘（只有 Joliet，名字带 ;1）追加后，Windows 上旧文件名不能变成 xxx_1。"""
         code, out = B.run_xorriso(B.COMMON_ARGS + [
             "-rockridge", "off", "-joliet", "on", "-compliance", "clear:joliet_long_names",
-            "-dev", self.iso, "-map", os.path.join(self.src, "工作报告.docx"), "/工作报告.docx", "-commit"])
+            "-dev", B.xpath(self.iso), "-map", B.xpath(os.path.join(self.src, "工作报告.docx")), "/工作报告.docx", "-commit"])
         self.assertEqual(code, 0, out)
         self.assertEqual(self.joliet_names(self.iso), ["工作报告.docx;1"])   # 像 IMAPI2 一样带 ;1
         entries = [e.path for e in B.list_disc_files(self.iso) if not e.is_dir]

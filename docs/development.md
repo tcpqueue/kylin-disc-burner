@@ -17,6 +17,7 @@ kylin-disc-burner/
 │   ├── backend.py          # xorriso 命令构造与输出解析、诊断、文件名恢复（不依赖 Qt）
 │   ├── gui.py              # PyQt5 界面
 │   ├── selftest.py         # --selftest 自检
+│   ├── winsys.py           # Windows 下的光驱和卷信息（ctypes）
 │   ├── __main__.py         # python3 -m discburner 入口
 │   └── __init__.py         # 版本号
 ├── tests/
@@ -29,7 +30,8 @@ kylin-disc-burner/
 │   ├── discburner.sh       # 启动器（安装为 /usr/bin/discburner）
 │   ├── discburner.desktop  # 开始菜单项
 │   ├── discburner.svg      # 图标
-│   └── wsl/release.sh      # 一键重新打包并测试
+│   ├── wsl/release.sh      # 一键重新打包并测试（麒麟版）
+│   └── windows/            # Windows 版：xorriso 编译脚本、补丁、打包脚本
 ├── build_deb.sh            # 打 deb 包
 └── docs/                   # 文档
 ```
@@ -72,6 +74,8 @@ discburner --selftest
 测试全部使用 ISO 镜像文件和虚构的文件名，不需要光驱。和光驱相关的解析测试使用真实光驱输出的样本，样本中的设备序列号、文件名等信息已替换为虚构内容。
 
 ## 构建离线安装包
+
+> Windows 绿色版的构建方法见 [Windows 版说明](windows.md#从源码构建)。
 
 ### 构建环境
 

@@ -19,8 +19,16 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
+import sys
+import tempfile
 from typing import Dict, List, Optional, Tuple
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    # Windows 版 xorriso 是 Cygwin 程序，按 LANG 决定命令行和文件名的字符集
+    os.environ["LANG"] = "C.UTF-8"
 
 SECTOR = 2048
 # ISO9660 主卷描述符里卷标最多 32 字节；Joliet 卷标最多 16 个字符
@@ -35,6 +43,11 @@ COMMON_ARGS = [
     "-return_with", "FAILURE", "32",
     "-local_charset", "UTF-8",
 ]
+if IS_WINDOWS:
+    # libburn 不认识的 \\.\X: 会被当成普通文件直接读写。"caution" 名单里的地址如果不是
+    # 刻录机就拒绝（"banned" 连真正的刻录机也会拒绝）。
+    # 这条规则里反斜杠要写两遍，实际传给 xorriso 的是 \\\\.\\*
+    COMMON_ARGS += ["-drive_class", "caution", r"\\\\.\\*"]
 
 # 读取和写入都必须带上：-joliet on 放在 -dev 之前，
 # 这样遇到 Windows 刻的只有 Joliet 没有 Rock Ridge 的盘也能读出正确的名字。
@@ -49,11 +62,60 @@ class XorrisoNotFound(RuntimeError):
     pass
 
 
-# 安装包自带的 xorriso（GNU xorriso 独立版，按 Ubuntu 16.04 / glibc 2.23 编译）
-BUNDLED_XORRISO = [
-    "/usr/share/discburner/bin/xorriso",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "xorriso"),
-]
+# ---------------------------------------------------------------- 平台差异
+#
+# Windows 版的 xorriso 是用 Cygwin + libcdio 编译的：光驱地址是 \\.\G:，
+# 本地路径要写成 /cygdrive/c/... 的形式。
+
+_WIN_DEV_RE = re.compile(r"^\\\\\.\\([A-Za-z]):$")
+
+
+def is_drive(dev: str) -> bool:
+    """光驱地址（而不是 ISO 镜像文件）。"""
+    if IS_WINDOWS:
+        return bool(_WIN_DEV_RE.match(dev))
+    return dev.startswith("/dev/")
+
+
+def drive_letter(dev: str) -> str:
+    m = _WIN_DEV_RE.match(dev)
+    return m.group(1).upper() if m else ""
+
+
+def windows_dev(letter: str) -> str:
+    return "\\\\.\\%s:" % letter.upper()
+
+
+def cygwin_path(path: str) -> str:
+    r"""C:\a\b → /cygdrive/c/a/b，\\server\share\x → //server/share/x"""
+    p = path.replace("\\", "/")
+    m = re.match(r"^([A-Za-z]):(/.*)?$", p)
+    if m:
+        return "/cygdrive/%s%s" % (m.group(1).lower(), m.group(2) or "/")
+    return p
+
+
+def xpath(path: str) -> str:
+    """交给 xorriso 的本地路径（要刻的文件、镜像文件）。光驱地址原样返回。"""
+    if not IS_WINDOWS or is_drive(path):
+        return path
+    return cygwin_path(os.path.abspath(path))
+
+
+_APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+if IS_WINDOWS:
+    # 绿色版：xorriso 目录和主程序放在一起；源码运行时放在项目目录下
+    BUNDLED_XORRISO = [
+        os.path.join(os.path.dirname(sys.executable), "xorriso", "xorriso.exe"),
+        os.path.join(_APP_DIR, "xorriso", "xorriso.exe"),
+    ]
+else:
+    # 安装包自带的 xorriso（GNU xorriso 独立版，按 Ubuntu 16.04 / glibc 2.23 编译）
+    BUNDLED_XORRISO = [
+        "/usr/share/discburner/bin/xorriso",
+        os.path.join(_APP_DIR, "bin", "xorriso"),
+    ]
 # 系统 xorriso 不低于这个版本时才优先于自带的。
 # 1.5.2（麒麟 SP1 自带）读 Windows 刻的盘时，Joliet 名带着“;1”版本号读进来，
 # 追加后 Windows 上 工作报告.docx 会变成 工作报告.docx_1；1.5.8 没有这个问题。
@@ -62,10 +124,15 @@ SYSTEM_XORRISO_MIN = (1, 5, 8)
 _xorriso_path = None
 
 
+def _no_window() -> Dict[str, int]:
+    """Windows 下从界面程序启动命令行程序时不弹出黑窗口。"""
+    return {"creationflags": 0x08000000} if IS_WINDOWS else {}   # CREATE_NO_WINDOW
+
+
 def xorriso_version(path: str) -> Tuple[int, ...]:
     try:
         out = subprocess.run([path, "-version"], stdout=subprocess.PIPE,
-                             stderr=subprocess.STDOUT, timeout=10).stdout
+                             stderr=subprocess.STDOUT, timeout=10, **_no_window()).stdout
     except (OSError, subprocess.SubprocessError):
         return ()
     m = re.search(rb"xorriso (\d+)\.(\d+)\.(\d+)", out)
@@ -84,7 +151,8 @@ def find_xorriso() -> str:
     if forced:
         _xorriso_path = forced
         return forced
-    system = shutil.which("xorriso")
+    # Windows 上 PATH 里的 xorriso 多半来自 MSYS2 之类，路径写法不同，不用
+    system = None if IS_WINDOWS else shutil.which("xorriso")
     if system and xorriso_version(system) >= SYSTEM_XORRISO_MIN:
         _xorriso_path = system
         return system
@@ -98,12 +166,70 @@ def find_xorriso() -> str:
     raise XorrisoNotFound("未找到可用的 xorriso，请重新安装本软件。")
 
 
+# Windows 下参数不能直接放在命令行上：Cygwin 程序会自己再解析一遍命令行，
+# 文件名里的单引号、星号等会被当成引号和通配符。所以把参数写进文件，
+# 用 -options_from_file 读入。文件里每行一条命令，一行最多 5 * 4096 字节。
+OPTIONS_LINE_MAX = 5 * 4096 - 2
+# 这些命令后面跟着以 "--" 结尾的参数列表，列表里的词即使以“-”开头也不是新命令
+_LIST_COMMANDS = {"-find", "-check_md5_r", "-file_size_limit"}
+_COMMAND_RE = re.compile(r"^-[a-z_]+$")
+
+
+def quote_word(word: str) -> str:
+    """xorriso 的引号规则：单引号里原样，单引号本身写成 '"'"'。"""
+    return "'" + word.replace("'", "'\"'\"'") + "'"
+
+
+def options_file_text(args: List[str]) -> str:
+    lines, cur, in_list = [], [], False
+    for a in args:
+        if cur and not in_list and _COMMAND_RE.match(a):
+            lines.append(cur)
+            cur = []
+        cur.append(a)
+        if a in _LIST_COMMANDS:
+            in_list = True
+        elif a == "--":
+            in_list = False
+    if cur:
+        lines.append(cur)
+    out = []
+    for words in lines:
+        line = " ".join(quote_word(w) for w in words)
+        if len(line.encode("utf-8")) > OPTIONS_LINE_MAX:
+            raise ValueError("参数太长：%s" % line[:200])
+        out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def xorriso_command(args: List[str]) -> Tuple[List[str], Optional[str]]:
+    """返回 (命令行, 用完后要删掉的参数文件)。"""
+    exe = find_xorriso()
+    if not IS_WINDOWS:
+        return [exe] + list(args), None
+    fd, path = tempfile.mkstemp(prefix="discburner-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write(options_file_text(args))
+    return [exe, "-options_from_file", cygwin_path(path)], path
+
+
+def remove_quietly(path: Optional[str]) -> None:
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def run_xorriso(args: List[str], timeout: int = 120) -> Tuple[int, str]:
     """同步运行 xorriso，返回 (退出码, 合并后的输出)。"""
-    proc = subprocess.run(
-        [find_xorriso()] + args,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=timeout)
+    cmd, tmp = xorriso_command(args)
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout, **_no_window())
+    finally:
+        remove_quietly(tmp)
     return proc.returncode, proc.stdout.decode("utf-8", "replace")
 
 
@@ -117,14 +243,15 @@ class Drive(object):
 
     @property
     def is_image(self) -> bool:
-        return not self.dev.startswith("/dev/")
+        return not is_drive(self.dev)
 
     @property
     def label(self) -> str:
         if self.is_image:
             return "ISO 镜像文件：%s" % self.dev
         name = " ".join(x for x in (self.vendor, self.model) if x)
-        return "%s  (%s)" % (name or "光驱", self.dev)
+        where = drive_letter(self.dev) + ":" if IS_WINDOWS else self.dev
+        return "%s  (%s)" % (name or "光驱", where)
 
     def __repr__(self):
         return "Drive(%r, %r, %r)" % (self.dev, self.vendor, self.model)
@@ -144,6 +271,19 @@ def parse_devices(text: str) -> List[Drive]:
         if m:
             drives.append(Drive(m.group(1), m.group(2), m.group(3)))
     return drives
+
+
+# 虚拟光驱软件的设备名，排到真刻录机后面
+_VIRTUAL_RE = re.compile(r"virtual|ezbsys|daemon|ultraiso|magiciso|poweriso|alcohol|wincdemu|msft|"
+                         r"iso cdvd|\bvcd\b", re.I)
+
+
+def is_virtual(d: Drive) -> bool:
+    return bool(_VIRTUAL_RE.search(d.vendor + " " + d.model))
+
+
+def sort_drives(drives: List[Drive]) -> List[Drive]:
+    return sorted(drives, key=is_virtual)
 
 
 def list_drives() -> List[Drive]:
@@ -169,6 +309,18 @@ def sysfs_drives(root: str = "/sys/block") -> List[Drive]:
                 info.append("")
         drives.append(Drive("/dev/" + name, *info))
     return drives
+
+
+def missing_drives(found: List[Drive]) -> List[str]:
+    """系统里有、但 xorriso 没列出来的光驱。
+
+    Linux 下把它们补进列表（见 sysfs_drives）。Windows 下不补：xorriso 打不开的
+    \\\\.\\X: 不能拿来刻录，只在“未找到刻录机”时告诉用户有哪些光驱没能识别。"""
+    known = {d.dev for d in found}
+    if IS_WINDOWS:
+        from . import winsys
+        return [windows_dev(c) for c in winsys.cdrom_letters() if windows_dev(c) not in known]
+    return [d.dev for d in sysfs_drives() if d.dev not in known and os.path.exists(d.dev)]
 
 
 # ---------------------------------------------------------------- 盘片信息
@@ -315,13 +467,13 @@ def parse_toc(text: str) -> MediaInfo:
 def toc_args(dev: str) -> List[str]:
     # 读取信息时遇到错误也不中止：会话没关好的盘加载目录可能失败，
     # 但 -toc 仍要照常输出，才能检测出“需要修复”
-    return COMMON_ARGS + ["-abort_on", "NEVER"] + FS_ARGS + ["-indev", dev, "-toc"]
+    return COMMON_ARGS + ["-abort_on", "NEVER"] + FS_ARGS + ["-indev", xpath(dev), "-toc"]
 
 
 def outdev_toc_args(dev: str) -> List[str]:
     """不加载盘上目录，只读光驱和盘片状态。目录坏了 -indev 拿不到光驱时用。"""
     return COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly",
-                          "-outdev", dev, "-toc"]
+                          "-outdev", xpath(dev), "-toc"]
 
 
 def indev_failed(out: str) -> bool:
@@ -376,7 +528,7 @@ def parse_lsdl(text: str) -> List[DiscEntry]:
 
 def list_files_args(dev: str) -> List[str]:
     return COMMON_ARGS + FS_ARGS + [
-        "-indev", dev, "-find", "/", "-exec", "lsdl", "--"]
+        "-indev", xpath(dev), "-find", "/", "-exec", "lsdl", "--"]
 
 
 def list_disc_files(dev: str) -> List[DiscEntry]:
@@ -392,6 +544,8 @@ def check_volid(volid: str) -> Optional[str]:
         return "卷标太长：最多 %d 字节（约 10 个汉字或 32 个英文字母）" % VOLID_MAX_BYTES
     if len(volid) > JOLIET_VOLID_MAX_CHARS:
         return "卷标太长：Windows 最多显示 %d 个字符" % JOLIET_VOLID_MAX_CHARS
+    if volid.startswith("-"):
+        return "卷标不能以“-”开头"
     return None
 
 
@@ -424,6 +578,17 @@ def version_fixups(paths, skip=()) -> List["Rename"]:
     return out
 
 
+def windows_perm_args(dsts: List[str]) -> List[str]:
+    """Windows 上 Cygwin 按 NTFS 权限换算出的 Rock Ridge 属性是 rwxrwx---、属主是 Windows
+    用户的编号，麒麟上的普通用户就读不了这些文件。统一改成 root 所有、文件 644、目录 755。"""
+    args = []
+    for dst in dsts:
+        args += ["-chown_r", "0", dst, "--", "-chgrp_r", "0", dst, "--",
+                 "-find", dst, "-type", "d", "-exec", "chmod", "0755", "--",
+                 "-find", dst, "-type", "f", "-exec", "chmod", "0644", "--"]
+    return args
+
+
 def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
               close: bool = False, speed: str = "", verify: bool = True,
               eject: bool = False, fixups=()) -> List[str]:
@@ -439,7 +604,7 @@ def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
     ]
     if verify:
         args += ["-md5", "on"]
-    args += ["-dev", dev]
+    args += ["-dev", xpath(dev)]
     if volid:
         args += ["-volid", volid]
     if speed:
@@ -449,10 +614,13 @@ def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
     for r in fixups:
         args += ["-move", r.old, r.new]
     for src, dst in items:
-        args += ["-map", src, dst]
+        args += ["-map", xpath(src), dst]
+    if IS_WINDOWS:
+        args += windows_perm_args([dst for _, dst in items])
     args += ["-commit"]
-    if verify and items:
-        args += ["-check_md5_r", "FAILURE"] + [dst for _, dst in items] + ["--"]
+    if verify:
+        for _, dst in items:     # 每项单独一条，Windows 下参数文件一行有长度限制
+            args += ["-check_md5_r", "FAILURE", dst, "--"]
     if eject:
         args += ["-eject", "all"]
     return args
@@ -461,11 +629,11 @@ def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
 def blank_args(dev: str) -> List[str]:
     """擦除可擦写盘。as_needed：DVD-RW 会格式化成可覆盖模式，
     以后用 xorriso 的模拟多会话无限追加。"""
-    return COMMON_ARGS + ["-outdev", dev, "-blank", "as_needed"]
+    return COMMON_ARGS + ["-outdev", xpath(dev), "-blank", "as_needed"]
 
 
 def eject_args(dev: str) -> List[str]:
-    return ["-outdev", dev, "-eject", "all"]
+    return ["-outdev", xpath(dev), "-eject", "all"]
 
 
 def repair_args(dev: str, keep_open: bool = True, force: bool = False) -> List[str]:
@@ -475,7 +643,7 @@ def repair_args(dev: str, keep_open: bool = True, force: bool = False) -> List[s
     force：光驱没标损坏、但轨道明显没写完（MediaInfo.unfinished）时用。
     -close off：只关会话不封盘，Windows 那边以后还能继续追加。
     """
-    return COMMON_ARGS + ["-outdev", dev, "-close", "on" if not keep_open else "off",
+    return COMMON_ARGS + ["-outdev", xpath(dev), "-close", "on" if not keep_open else "off",
                           "-close_damaged", "force" if force else "as_needed"]
 
 
@@ -570,7 +738,7 @@ def parse_tracks(text: str) -> List[Track]:
 def diag_toc_args(dev: str) -> List[str]:
     # shared:readonly：光盘已被系统挂载时也能读取信息，不需要先卸载
     return COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly",
-                          "-joliet", "on", "-indev", dev, "-toc"]
+                          "-joliet", "on", "-indev", xpath(dev), "-toc"]
 
 
 def _decode_udev_enc(s: str) -> str:
@@ -620,10 +788,11 @@ def scan_vrs(path: str) -> List[str]:
     """读第 16 扇区起的卷识别序列：CD001=ISO9660，BEA01/NSR02/NSR03/TEA01=UDF。"""
     ids = []
     try:
-        with open(path, "rb") as f:
+        # Windows 的 \\.\G: 只能按整扇区读
+        with open(path, "rb", buffering=0) as f:
             for sector in range(16, 32):
                 f.seek(sector * SECTOR)
-                block = f.read(7)
+                block = f.read(SECTOR)
                 if len(block) < 7:
                     break
                 ident = block[1:6].decode("ascii", "replace")
@@ -635,6 +804,70 @@ def scan_vrs(path: str) -> List[str]:
     except OSError:
         pass
     return ids
+
+
+def udf_revision(path: str) -> str:
+    """从逻辑卷描述符的域标识读 UDF 版本，例如 "2.01"；读不到返回 ""。
+    光盘的块大小是 2048；mkudffs 做的硬盘镜像默认是 512，两种都试。"""
+    try:
+        with open(path, "rb", buffering=0) as f:
+            for bs in (SECTOR, 512):
+                rev = _udf_revision(f, bs)
+                if rev:
+                    return rev
+    except (OSError, struct.error):
+        pass
+    return ""
+
+
+def _read_block(f, bs: int, block: int) -> bytes:
+    # Windows 的 \\.\G: 只能按整扇区读，512 字节的块也按 2048 读出来再截取
+    pos = block * bs
+    f.seek(pos - pos % SECTOR)
+    data = f.read(SECTOR)
+    return data[pos % SECTOR:pos % SECTOR + bs]
+
+
+def _udf_revision(f, bs: int) -> str:
+    avdp = _read_block(f, bs, 256)          # 锚点卷描述符指针（AVDP）
+    if len(avdp) < 24 or struct.unpack("<H", avdp[:2])[0] != 2:
+        return ""
+    length, loc = struct.unpack("<II", avdp[16:24])
+    for i in range(min(length // bs, 64)):
+        d = _read_block(f, bs, loc + i)
+        tag = struct.unpack("<H", d[:2])[0] if len(d) >= 2 else 8
+        if tag == 6 and len(d) >= 250:      # 逻辑卷描述符，域标识在偏移 216
+            if d[217:240].rstrip(b"\0") == b"*OSTA UDF Compliant":
+                rev = struct.unpack("<H", d[240:242])[0]
+                return "%x.%02x" % (rev >> 8, rev & 0xff)
+        if tag == 8:                            # 终止描述符
+            break
+    return ""
+
+
+def toc_offers_joliet(toc: str) -> bool:
+    return any(l.startswith("ISO offers") and "Joliet" in l for l in toc.splitlines())
+
+
+def probe_fs_direct(dev: str, toc: str, vrs: List[str]) -> Dict[str, str]:
+    """不靠 blkid，直接读盘识别文件系统（Windows 下用）。"""
+    fs = {}
+    if any(x in vrs for x in ("NSR02", "NSR03")):
+        fs = {"type": "udf", "version": udf_revision(dev)}
+    elif "CD001" in vrs:
+        fs = {"type": "iso9660", "version": "Joliet Extension" if toc_offers_joliet(toc) else ""}
+    if IS_WINDOWS and is_drive(dev):
+        from . import winsys
+        info = winsys.volume_info(drive_letter(dev))
+        if info:
+            label, name = info
+            if not fs:      # 读不了原始扇区时，至少用 Windows 认出的文件系统
+                fs = {"type": {"CDFS": "iso9660", "UDF": "udf"}.get(name.upper(), name.lower()),
+                      "version": ""}
+            fs["label"] = label
+    if fs and not fs.get("label"):
+        fs["label"] = parse_toc(toc).volume_id
+    return fs
 
 
 def describe_fs(fs: Dict[str, str], vrs: List[str]) -> str:
@@ -658,7 +891,9 @@ def describe_fs(fs: Dict[str, str], vrs: List[str]) -> str:
 
 
 def kernel_udf_support() -> str:
-    """'loaded' / 'module' / 'missing'"""
+    """'loaded' / 'module' / 'missing'；Windows 自带 UDF 支持，返回 'windows'"""
+    if IS_WINDOWS:
+        return "windows"
     try:
         with open("/proc/filesystems") as f:
             if any(l.split()[-1] == "udf" for l in f if l.strip()):
@@ -694,7 +929,13 @@ def _unescape_mount(s: str) -> str:
 
 
 def mount_info(dev: str) -> Optional[Tuple[str, str, str]]:
-    """(挂载点, 文件系统, 挂载选项)，未挂载返回 None。"""
+    """(挂载点, 文件系统, 挂载选项)，未挂载返回 None。
+    Windows 自动挂载光盘：认出文件系统就算已挂载，挂载点是盘符根目录。"""
+    if IS_WINDOWS:
+        from . import winsys
+        letter = drive_letter(dev)
+        info = winsys.volume_info(letter) if letter else None
+        return (letter + ":\\", info[1], "") if info else None
     try:
         real = os.path.realpath(dev)
         with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
@@ -714,7 +955,7 @@ INFO, OK, WARN, ERROR = "info", "ok", "warn", "error"
 class Diagnosis(object):
     def __init__(self, dev: str):
         self.dev = dev
-        self.is_image = not dev.startswith("/dev/")
+        self.is_image = not is_drive(dev)
         self.media = MediaInfo()
         self.tracks = []          # type: List[Track]
         self.fs = {}              # type: Dict[str, str]
@@ -739,7 +980,8 @@ class Diagnosis(object):
 
     @property
     def can_mount(self) -> bool:
-        return (not self.is_image and not self.media.blank
+        # Windows 自己挂载光盘，认不出文件系统时也没有别的办法挂上
+        return (not IS_WINDOWS and not self.is_image and not self.media.blank
                 and self.mount is None and bool(self.fs_text))
 
     def info_rows(self) -> List[Tuple[str, str]]:
@@ -753,7 +995,8 @@ class Diagnosis(object):
             if self.fs_text:
                 rows += [("文件系统", self.fs_text), ("卷标", self.fs.get("label") or "—")]
             if not self.is_image:
-                rows.append(("挂载状态", "已挂载到 %s（%s）" % (self.mount[0], self.mount[1])
+                rows.append(("Windows 识别" if IS_WINDOWS else "挂载状态",
+                             "已挂载到 %s（%s）" % (self.mount[0], self.mount[1])
                              if self.mount else "未挂载"))
             return rows
         rows += [("光盘类型", "ISO 镜像文件" if self.is_image else m.profile),
@@ -766,6 +1009,11 @@ class Diagnosis(object):
         if m.has_iso:
             rows.append(("只剩短名的文件", "%d 个" % len(self.short_names) if self.short_names else "无"))
         if not self.is_image:
+            if IS_WINDOWS:
+                # Windows 的光盘卷大小只算最后一个会话，不能当“可读容量”看，不显示
+                rows.append(("Windows 识别", "%s（%s）" % (self.mount[0], self.mount[1])
+                             if self.mount else "没有识别出文件系统"))
+                return rows
             rows.append(("系统可读容量", "—" if self.kernel_bytes is None
                          else human_size(self.kernel_bytes)))
             rows.append(("内核 UDF 支持", {"loaded": "已启用", "module": "有（未加载，挂载时自动加载）",
@@ -802,14 +1050,19 @@ def diagnose(dev: str) -> Diagnosis:
     d.tracks = parse_tracks(toc)
     if not d.is_image:
         d.mount = mount_info(dev)
-        d.kernel_bytes = kernel_capacity(dev)
         d.kernel_udf = kernel_udf_support()
+        if not IS_WINDOWS:
+            d.kernel_bytes = kernel_capacity(dev)
     # xorriso 读不到盘片信息时（光驱被别的程序占用等）也照样识别文件系统，能识别就还能挂载
-    if (d.media.present and not d.media.blank) or (not d.media.present and os.path.exists(dev)):
-        d.fs, blk = probe_blkid(dev)
-        d.raw.append(("blkid -p -o udev", blk))
+    if (d.media.present and not d.media.blank) or             (not d.media.present and (is_drive(dev) or os.path.exists(dev))):
         d.vrs = scan_vrs(dev)
         d.raw.append(("卷识别序列（第 16 扇区起）", " ".join(d.vrs) or "（读不到）"))
+        if IS_WINDOWS:
+            d.fs = probe_fs_direct(dev, toc, d.vrs)
+            d.raw.append(("文件系统", repr(d.fs)))
+        else:
+            d.fs, blk = probe_blkid(dev)
+            d.raw.append(("blkid -p -o udev", blk))
         d.fs_text = describe_fs(d.fs, d.vrs)
     if d.media.has_iso:
         _, cur = run_xorriso(session_files_args(dev), timeout=300)
@@ -840,7 +1093,8 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
     is_udf = fs_type == "udf" or (not fs_type and any(x in d.vrs for x in ("NSR02", "NSR03")))
     if is_udf:
         out.append((INFO, "这是 UDF 格式的盘（%s），一般是 Windows 用“类似 USB 闪存驱动器”方式刻录的。"
-                          "可以挂载后直接读取；本软件不能向这种盘追加文件。" % d.fs_text))
+                          "%s；本软件不能向这种盘追加文件。" % (
+                              d.fs_text, "可以在资源管理器里直接打开" if IS_WINDOWS else "可以挂载后直接读取")))
         if d.kernel_udf == "missing":
             out.append((ERROR, "系统内核没有 UDF 支持，无法挂载这张盘。请联系管理员。"))
     elif d.fs_text.startswith("ISO9660"):
@@ -876,7 +1130,8 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
     elif m.appendable and not m.needs_repair and not is_udf:
         out.append((OK, "盘片可追加，剩余 %s。" % human_size(m.free_bytes)))
     if d.mount:
-        out.append((OK, "已挂载到 %s，可以直接打开。" % d.mount[0]))
+        out.append((OK, ("Windows 已识别出这张盘（%s），可以直接打开。" if IS_WINDOWS
+                         else "已挂载到 %s，可以直接打开。") % d.mount[0]))
     return out
 
 
@@ -912,7 +1167,7 @@ def session_files_args(dev: str, sbsector: Optional[int] = None) -> List[str]:
     args = COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly", "-joliet", "on"]
     if sbsector is not None:
         args += ["-load", "sbsector", str(sbsector)]
-    return args + ["-indev", dev, "-find", "/", "-type", "f", "-exec", "report_lba", "--"]
+    return args + ["-indev", xpath(dev), "-find", "/", "-type", "f", "-exec", "report_lba", "--"]
 
 
 class Rename(object):
@@ -988,7 +1243,7 @@ def plan_name_recovery(dev: str, progress=None) -> RecoveryPlan:
 def rename_args(dev: str, renames: List[Rename], close: bool = False, fixups=(),
                 speed: str = "") -> List[str]:
     """追加一个只改名字的会话。-move 正好两个参数，不会吞掉后面的命令。"""
-    args = COMMON_ARGS + FS_ARGS + ["-dev", dev]
+    args = COMMON_ARGS + FS_ARGS + ["-dev", xpath(dev)]
     if speed:
         args += ["-speed", speed]
     args += ["-close", "on" if close else "off"]
@@ -1005,6 +1260,8 @@ def mount_disc(dev: str) -> Tuple[Optional[str], str]:
     m = mount_info(dev)
     if m:
         return m[0], "已经挂载在 %s" % m[0]
+    if IS_WINDOWS:
+        return None, "Windows 没有识别出这张盘上的文件系统，无法打开。"
     udisksctl = find_tool("udisksctl")
     manual = ("可以在终端手动挂载：\nsudo mkdir -p /mnt/cd && "
               "sudo mount -o ro,iocharset=utf8 %s /mnt/cd" % dev)
@@ -1034,6 +1291,9 @@ def unmount_disc(dev: str) -> Tuple[bool, str]:
 
 
 def open_folder(path: str) -> bool:
+    if IS_WINDOWS:
+        from . import winsys
+        return winsys.open_folder(path)
     for cmd in ("xdg-open", "peony", "caja", "nautilus"):
         exe = shutil.which(cmd)
         if exe:
@@ -1053,8 +1313,9 @@ def is_mounted(dev: str) -> bool:
 
 
 def unmount(dev: str) -> None:
-    """麒麟会自动挂载光盘，挂载状态下 libburn 打不开设备，刻录前先卸载。"""
-    if not dev.startswith("/dev/") or not is_mounted(dev):
+    """麒麟会自动挂载光盘，挂载状态下 libburn 打不开设备，刻录前先卸载。
+    Windows 下光驱挂载着也能刻录，不用处理。"""
+    if IS_WINDOWS or not dev.startswith("/dev/") or not is_mounted(dev):
         return
     for cmd in (["udisksctl", "unmount", "-b", dev, "--no-user-interaction"],
                 ["umount", dev]):
@@ -1063,6 +1324,14 @@ def unmount(dev: str) -> None:
                            stderr=subprocess.DEVNULL)
             if not is_mounted(dev):
                 return
+
+
+def refresh_system_view(dev: str) -> None:
+    """写完光盘后让系统重新读目录。Windows 会一直用旧的卷缓存，要卸下卷让它重新挂载；
+    麒麟刻录前已经卸载，下次访问自然是新内容。"""
+    if IS_WINDOWS and is_drive(dev):
+        from . import winsys
+        winsys.dismount(drive_letter(dev))
 
 
 def local_size(path: str) -> Tuple[int, int]:

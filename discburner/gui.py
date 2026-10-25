@@ -7,8 +7,8 @@ import os
 import sys
 import time
 
-from PyQt5.QtCore import QObject, QProcess, Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtGui import QIcon
+from PyQt5.QtCore import QObject, QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtGui import QFont, QFontDatabase, QIcon
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
@@ -20,7 +20,11 @@ from . import backend as B
 
 APP_NAME = "光盘刻录助手"
 IMAGE_ITEM = "__image__"
-LOG_DIR = os.path.expanduser("~/.local/share/discburner/logs")
+if B.IS_WINDOWS:
+    LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                           "discburner", "logs")
+else:
+    LOG_DIR = os.path.expanduser("~/.local/share/discburner/logs")
 # 写入进度这么久没变就提示检查光驱。xorriso 卡住时仍会每秒打印同样的进度行，
 # 只看有没有输出是看不出来的
 STALL_SECONDS = 90
@@ -46,11 +50,13 @@ class Job(QObject):
         err_signal.connect(self._error)
         self._buf = b""
         self._out = []
+        self._tmp = None
 
     def start(self, args):
         self._buf = b""
         self._out = []
-        self.proc.start(B.find_xorriso(), args)
+        cmd, self._tmp = B.xorriso_command(args)
+        self.proc.start(cmd[0], cmd[1:])
 
     def running(self):
         return self.proc.state() != QProcess.NotRunning
@@ -76,6 +82,8 @@ class Job(QObject):
             self._emit_line(raw)
 
     def _done(self, code, status):
+        B.remove_quietly(self._tmp)
+        self._tmp = None
         if self._buf:
             self._emit_line(self._buf)
             self._buf = b""
@@ -85,6 +93,8 @@ class Job(QObject):
 
     def _error(self, err):
         if err == QProcess.FailedToStart:
+            B.remove_quietly(self._tmp)
+            self._tmp = None
             self.finished.emit(-1, "无法启动 xorriso")
 
 
@@ -205,7 +215,7 @@ class DiagDialog(QDialog):
         d = self.diag
         self.btn_mount.setVisible(bool(d and d.can_mount))
         self.btn_open.setVisible(bool(d and d.mount))
-        self.btn_unmount.setVisible(bool(d and d.mount))
+        self.btn_unmount.setVisible(bool(d and d.mount) and not B.IS_WINDOWS)
         self.btn_repair.setVisible(bool(d and d.media.needs_repair and not d.is_image))
         self.btn_names.setVisible(bool(d and d.can_recover_names))
         for b in (self.btn_mount, self.btn_open, self.btn_unmount, self.btn_repair,
@@ -413,8 +423,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("%s %s" % (APP_NAME, __version__))
-        self.setWindowIcon(QIcon.fromTheme("discburner",
-                                           QIcon.fromTheme("media-optical-burn")))
+        self.setWindowIcon(app_icon())
         self.resize(1000, 700)
 
         self.media = B.MediaInfo()
@@ -659,6 +668,8 @@ class MainWindow(QMainWindow):
     def _job_finished(self, code, out):
         self._stall_timer.stop()
         self.lb_stage.setStyleSheet("")
+        if self.burning:
+            B.refresh_system_view(self.current_dev())
         self._set_busy(False)
         cb, self._on_finish = self._on_finish, None
         if cb:
@@ -675,10 +686,10 @@ class MainWindow(QMainWindow):
         self._run(["-devices"], self._drives_done, "正在扫描刻录机……")
 
     def _drives_done(self, code, out):
-        self.drives = B.parse_devices(out)
-        known = {d.dev for d in self.drives}
-        self.drives += [d for d in B.sysfs_drives()
-                        if d.dev not in known and os.path.exists(d.dev)]
+        self.drives = B.sort_drives(B.parse_devices(out))
+        unknown = B.missing_drives(self.drives)
+        if not B.IS_WINDOWS:
+            self.drives += [d for d in B.sysfs_drives() if d.dev in unknown]
         self.cb_drive.clear()
         for d in self.drives:
             self.cb_drive.addItem(QIcon.fromTheme("drive-optical"), d.label, d.dev)
@@ -686,8 +697,16 @@ class MainWindow(QMainWindow):
                               "生成 / 追加 ISO 镜像文件…", IMAGE_ITEM)
         self.lb_stage.setText("就绪")
         if self.drives:
-            self.cb_drive.setCurrentIndex(0)
+            # 上次用的光驱优先（电脑上常有虚拟光驱排在真刻录机前面）
+            last = self.cb_drive.findData(QSettings("discburner", "discburner").value("drive", ""))
+            self.cb_drive.setCurrentIndex(max(last, 0))
             self.refresh_media()
+        elif B.IS_WINDOWS:
+            text = "<b>未找到刻录机。</b>请检查光驱连接和供电，然后点“刷新”。"
+            if unknown:
+                text += ("<br>系统里有光驱 %s，但无法以刻录方式打开（可能是虚拟光驱，"
+                         "或正被其他刻录软件占用）。" % "、".join(B.drive_letter(x) + ":" for x in unknown))
+            self.lb_media.setText(text)
         else:
             self.lb_media.setText(
                 "<b>未找到刻录机。</b>请检查光驱连接；若已连接，确认当前用户有权限访问 "
@@ -717,10 +736,12 @@ class MainWindow(QMainWindow):
         dev = self.current_dev()
         if not dev or dev == IMAGE_ITEM:
             return
+        if B.is_drive(dev):
+            QSettings("discburner", "discburner").setValue("drive", dev)
         self.media = B.MediaInfo()
         self.disc_entries = []
         self.tree_disc.clear()
-        if not dev.startswith("/dev/") and not os.path.exists(dev):
+        if not B.is_drive(dev) and not os.path.exists(dev):
             # 新镜像文件：当作空白盘
             self.media.present = self.media.blank = True
             self._show_media()
@@ -733,7 +754,7 @@ class MainWindow(QMainWindow):
 
     def _media_done(self, code, out):
         dev = self.current_dev()
-        if B.indev_failed(out) and dev.startswith("/dev/") and not self._outdev_retry:
+        if B.indev_failed(out) and B.is_drive(dev) and not self._outdev_retry:
             # 盘上目录读不出时 -indev 连光驱都不接管；改用 -outdev 只读光驱和盘片状态
             self._outdev_retry = True
             self._run(B.outdev_toc_args(dev), self._media_done, "正在读取光驱状态……")
@@ -769,7 +790,7 @@ class MainWindow(QMainWindow):
 
     def _show_media(self):
         m = self.media
-        is_image = not self.current_dev().startswith("/dev/")
+        is_image = not B.is_drive(self.current_dev())
         if not m.present:
             self.lb_media.setText("<b>未检测到光盘</b>，请放入光盘后点“刷新”。")
         else:
@@ -893,7 +914,7 @@ class MainWindow(QMainWindow):
         pending = sum(x[2] for x in items)
         files = sum(x[3] for x in items)
         bar = self.bar_capacity
-        is_image = not self.current_dev().startswith("/dev/")
+        is_image = not B.is_drive(self.current_dev())
         if is_image or not self.media.present:
             bar.setRange(0, 1)
             bar.setValue(0)
@@ -954,7 +975,7 @@ class MainWindow(QMainWindow):
 
         pending = sum(x[2] for x in items)
         need = pending + B.estimate_overhead(sum(x[3] for x in items))
-        if dev.startswith("/dev/") and need > m.free_bytes:
+        if B.is_drive(dev) and need > m.free_bytes:
             return QMessageBox.warning(
                 self, APP_NAME, "空间不足：需要约 %s，光盘剩余 %s。" %
                 (B.human_size(need), B.human_size(m.free_bytes)))
@@ -1054,7 +1075,7 @@ class MainWindow(QMainWindow):
         dev = self.current_dev()
         if not dev or dev == IMAGE_ITEM:
             return QMessageBox.information(self, APP_NAME, "请先选择刻录机。")
-        if not dev.startswith("/dev/") and not os.path.exists(dev):
+        if not B.is_drive(dev) and not os.path.exists(dev):
             return QMessageBox.information(self, APP_NAME, "镜像文件还不存在。")
         dlg = DiagDialog(self, dev)
         dlg.exec_()
@@ -1105,7 +1126,7 @@ class MainWindow(QMainWindow):
 
     def repair(self, ask=True):
         dev = self.current_dev()
-        if not dev.startswith("/dev/"):
+        if not B.is_drive(dev):
             return
         if ask and QMessageBox.question(
                 self, "修复未关闭会话",
@@ -1143,7 +1164,7 @@ class MainWindow(QMainWindow):
 
     def eject(self):
         dev = self.current_dev()
-        if not dev.startswith("/dev/"):
+        if not B.is_drive(dev):
             return
         B.unmount(dev)
         self._run(B.eject_args(dev), lambda c, o: self._ejected(), "正在弹出……")
@@ -1166,11 +1187,35 @@ class MainWindow(QMainWindow):
         e.accept()
 
 
+def app_icon():
+    icon = QIcon.fromTheme("discburner", QIcon.fromTheme("media-optical-burn"))
+    if not icon.isNull():
+        return icon
+    # Windows 没有图标主题，用随程序带的图标
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (os.path.join(getattr(sys, "_MEIPASS", here), "discburner.svg"),
+                 os.path.join(os.path.dirname(here), "packaging", "discburner.svg")):
+        if os.path.exists(path):
+            return QIcon(path)
+    return icon
+
+
+def setup_app(app):
+    app.setApplicationName(APP_NAME)
+    if B.IS_WINDOWS:
+        # Qt 在中文 Windows 上默认用宋体，换成系统界面用的雅黑
+        for family in ("Microsoft YaHei UI", "Microsoft YaHei"):
+            if family in QFontDatabase().families():
+                app.setFont(QFont(family, 9))
+                break
+        app.setWindowIcon(app_icon())
+
+
 def main():
     if hasattr(Qt, "AA_EnableHighDpiScaling"):   # Qt 5.6+
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_NAME)
+    setup_app(app)
     # Qt 5.7 才有；麒麟 V10 2020 版是 Qt 5.6.1，没有这个接口
     if hasattr(app, "setDesktopFileName"):
         app.setDesktopFileName("discburner")
