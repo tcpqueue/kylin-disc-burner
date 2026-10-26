@@ -464,16 +464,20 @@ def parse_toc(text: str) -> MediaInfo:
     return info
 
 
+# 只读时以共享方式打开光驱：系统挂载着光盘也能读，不用先卸载，文件管理器里照常能看到
+READ_ACCESS = ["-drive_access", "shared:readonly"]
+
+
 def toc_args(dev: str) -> List[str]:
     # 读取信息时遇到错误也不中止：会话没关好的盘加载目录可能失败，
     # 但 -toc 仍要照常输出，才能检测出“需要修复”
-    return COMMON_ARGS + ["-abort_on", "NEVER"] + FS_ARGS + ["-indev", xpath(dev), "-toc"]
+    return COMMON_ARGS + ["-abort_on", "NEVER"] + READ_ACCESS + FS_ARGS + \
+        ["-indev", xpath(dev), "-toc"]
 
 
 def outdev_toc_args(dev: str) -> List[str]:
     """不加载盘上目录，只读光驱和盘片状态。目录坏了 -indev 拿不到光驱时用。"""
-    return COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly",
-                          "-outdev", xpath(dev), "-toc"]
+    return COMMON_ARGS + ["-abort_on", "NEVER"] + READ_ACCESS + ["-outdev", xpath(dev), "-toc"]
 
 
 def indev_failed(out: str) -> bool:
@@ -527,7 +531,7 @@ def parse_lsdl(text: str) -> List[DiscEntry]:
 
 
 def list_files_args(dev: str) -> List[str]:
-    return COMMON_ARGS + FS_ARGS + [
+    return COMMON_ARGS + READ_ACCESS + FS_ARGS + [
         "-indev", xpath(dev), "-find", "/", "-exec", "lsdl", "--"]
 
 
@@ -736,9 +740,8 @@ def parse_tracks(text: str) -> List[Track]:
 
 
 def diag_toc_args(dev: str) -> List[str]:
-    # shared:readonly：光盘已被系统挂载时也能读取信息，不需要先卸载
-    return COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly",
-                          "-joliet", "on", "-indev", xpath(dev), "-toc"]
+    return COMMON_ARGS + ["-abort_on", "NEVER"] + READ_ACCESS + \
+        ["-joliet", "on", "-indev", xpath(dev), "-toc"]
 
 
 def _decode_udev_enc(s: str) -> str:
@@ -1165,7 +1168,7 @@ def parse_report_lba(text: str) -> Dict[str, Tuple[int, int]]:
 
 
 def session_files_args(dev: str, sbsector: Optional[int] = None) -> List[str]:
-    args = COMMON_ARGS + ["-abort_on", "NEVER", "-drive_access", "shared:readonly", "-joliet", "on"]
+    args = COMMON_ARGS + ["-abort_on", "NEVER"] + READ_ACCESS + ["-joliet", "on"]
     if sbsector is not None:
         args += ["-load", "sbsector", str(sbsector)]
     return args + ["-indev", xpath(dev), "-find", "/", "-type", "f", "-exec", "report_lba", "--"]
@@ -1314,8 +1317,8 @@ def is_mounted(dev: str) -> bool:
 
 
 def unmount(dev: str) -> None:
-    """麒麟会自动挂载光盘，挂载状态下 libburn 打不开设备，刻录前先卸载。
-    Windows 下光驱挂载着也能刻录，不用处理。"""
+    """麒麟会自动挂载光盘，挂载状态下 libburn 不能独占光驱写入，写入前先卸载。
+    只读不用卸载（见 READ_ACCESS）。Windows 下光驱挂载着也能刻录，不用处理。"""
     if IS_WINDOWS or not dev.startswith("/dev/") or not is_mounted(dev):
         return
     for cmd in (["udisksctl", "unmount", "-b", dev, "--no-user-interaction"],

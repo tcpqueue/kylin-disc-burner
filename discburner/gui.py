@@ -430,6 +430,7 @@ class MainWindow(QMainWindow):
         self.disc_entries = []
         self.drives = []
         self.burning = False
+        self._remount = ""   # 写入前被卸载、写完要挂回去的设备
         self._outdev_retry = False
         # 已经提示过修复的设备，避免每次刷新都弹窗；换盘/弹出后清空
         self._repair_prompted = ""
@@ -664,6 +665,9 @@ class MainWindow(QMainWindow):
             self.job.start(args)
         except B.XorrisoNotFound as e:
             self._stall_timer.stop()
+            if self._remount:
+                B.mount_disc(self._remount)
+                self._remount = ""
             self._set_busy(False)
             QMessageBox.critical(self, APP_NAME, str(e))
 
@@ -672,6 +676,9 @@ class MainWindow(QMainWindow):
         self.lb_stage.setStyleSheet("")
         if self.burning:
             B.refresh_system_view(self.current_dev())
+        if self._remount:
+            dev, self._remount = self._remount, ""
+            B.mount_disc(dev)
         self._set_busy(False)
         cb, self._on_finish = self._on_finish, None
         if cb:
@@ -679,6 +686,12 @@ class MainWindow(QMainWindow):
 
     def current_dev(self):
         return self.cb_drive.currentData() or ""
+
+    def _release_drive(self, dev, remount=True):
+        """写入前把光盘从系统卸下（挂载着不能独占光驱）。原来挂载着的，写完再挂回去，
+        文件管理器里照常能看到；写完要弹出的就不用了。"""
+        self._remount = dev if remount and not B.IS_WINDOWS and B.is_mounted(dev) else ""
+        B.unmount(dev)
 
     # ------------------------------------------------------------ 刻录机 / 盘片
 
@@ -748,7 +761,6 @@ class MainWindow(QMainWindow):
             self.media.present = self.media.blank = True
             self._show_media()
             return
-        B.unmount(dev)
         self.lb_media.setText("正在读取光盘信息……")
         self._outdev_retry = False
         args = B.toc_args(dev) + ["-find", "/", "-exec", "lsdl", "--"]
@@ -1004,7 +1016,7 @@ class MainWindow(QMainWindow):
         if QMessageBox.question(self, "确认刻录", "\n".join(lines)) != QMessageBox.Yes:
             return
 
-        B.unmount(dev)
+        self._release_drive(dev, remount=not self._eject_after(dev))
         args = B.burn_args(
             dev, [(s, d) for s, d, _z, _c in items], volid=volid,
             close=not keep_open, speed=self.cb_speed.currentData(),
@@ -1066,7 +1078,7 @@ class MainWindow(QMainWindow):
                 "将擦除光盘上的全部数据，且无法恢复。\n\n继续？",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
-        B.unmount(dev)
+        self._release_drive(dev, remount=False)   # 擦除后是空白盘，没有可挂载的
         self._run(B.blank_args(dev), self._blank_done, "正在擦除……", burning=True)
 
     def _blank_done(self, code, out):
@@ -1093,7 +1105,7 @@ class MainWindow(QMainWindow):
         return dlg
 
     def apply_renames(self, dev, renames, fixups=()):
-        B.unmount(dev)
+        self._release_drive(dev)
         self.log.clear()
         self._renames = list(renames) + list(fixups)
         self._run(B.rename_args(dev, renames, fixups=fixups, speed=self.cb_speed.currentData()),
@@ -1139,7 +1151,7 @@ class MainWindow(QMainWindow):
                 "将关闭光盘上未关闭的会话，已有数据不会被删除，光盘仍可继续追加。\n\n继续？") \
                 != QMessageBox.Yes:
             return
-        B.unmount(dev)
+        self._release_drive(dev)
         self.log.clear()
         # 光驱没标“损坏”、但轨道明显没写完时，as_needed 会什么都不做，要强制关闭
         force = self.media.unfinished and not self.media.damaged

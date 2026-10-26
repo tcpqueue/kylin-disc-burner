@@ -412,6 +412,13 @@ class ParseTests(unittest.TestCase):
         for good in (TOC_BLANK, TOC_APPENDABLE, TOC_CLOSED, TOC_FOREIGN):
             self.assertFalse(B.parse_toc(good).unfinished)
 
+    def test_reads_do_not_need_unmount(self):
+        """只读的命令都以共享只读方式打开光驱：系统挂载着也能读，不用卸载。"""
+        for args in (B.toc_args(DEV), B.list_files_args(DEV), B.diag_toc_args(DEV),
+                     B.session_files_args(DEV), B.outdev_toc_args(DEV)):
+            self.assertIn("-drive_access shared:readonly", " ".join(args))
+        self.assertNotIn("shared:readonly", " ".join(B.burn_args(DEV, [("/x", "/x")])))
+
     def test_indev_failed(self):
         self.assertTrue(B.indev_failed(INDEV_FAILED))
         self.assertTrue(B.parse_toc(INDEV_FAILED).tree_unreadable)

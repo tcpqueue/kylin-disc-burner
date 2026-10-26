@@ -84,6 +84,28 @@ def main():
     assert win.media.appendable and win.media.sessions == 1, win.media.raw
     assert win.tree_new.topLevelItemCount() == 0
 
+    # 刷新只是读，不能把系统挂载的光盘卸掉（文件管理器会读不到）；
+    # 写入前卸掉的，写完要挂回去
+    calls = []
+    real = B.unmount, B.is_mounted, B.mount_disc
+    B.unmount = lambda d: calls.append(("unmount", d))
+    B.is_mounted = lambda d: True
+    B.mount_disc = lambda d: calls.append(("mount", d)) or (d, "")
+    try:
+        win.refresh_media()
+        wait(app, win)
+        assert calls == [], calls
+        if not B.IS_WINDOWS:
+            win._release_drive("/dev/sr9")
+            win._job_finished(0, "")
+            assert calls == [("unmount", "/dev/sr9"), ("mount", "/dev/sr9")], calls
+            del calls[:]
+            win._release_drive("/dev/sr9", remount=False)   # 写完弹出的不挂回
+            win._job_finished(0, "")
+            assert calls == [("unmount", "/dev/sr9")], calls
+    finally:
+        B.unmount, B.is_mounted, B.mount_disc = real
+
     # 第二次追加，放进日期目录
     win.ed_target.setText("/2025-10-25")
     win.add_paths([os.path.join(src, "2025年度预算表（最终版）.xlsx")])
