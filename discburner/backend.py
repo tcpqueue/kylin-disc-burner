@@ -540,6 +540,54 @@ def list_disc_files(dev: str) -> List[DiscEntry]:
     return parse_lsdl(out)
 
 
+# ---------------------------------------------------------------- 取出光盘上的文件
+
+def top_level(disc_paths: List[str]) -> List[str]:
+    """去掉已经包含在其他所选文件夹里的项目，免得复制两遍。"""
+    keep = []
+    for p in sorted(set(disc_paths)):
+        if not any(p.startswith(k.rstrip("/") + "/") for k in keep):
+            keep.append(p)
+    return keep
+
+
+def disc_basename(path: str) -> str:
+    return path.rstrip("/").rsplit("/", 1)[-1]
+
+
+def local_paths(dev: str, disc_paths: List[str]) -> Optional[List[str]]:
+    """光盘被系统挂载着时，盘上路径在本机的对应路径；有任何一个对不上就返回 None。"""
+    m = mount_info(dev) if is_drive(dev) else None
+    if not m:
+        return None
+    out = [os.path.join(m[0], *p.strip("/").split("/")) for p in disc_paths]
+    return out if all(os.path.exists(p) for p in out) else None
+
+
+def extract_args(dev: str, disc_paths: List[str], dest: str) -> List[str]:
+    """把光盘上的文件或文件夹取到本地目录 dest 下，不用挂载，镜像文件也行。
+    auto_chmod_on：盘上只读的文件夹也能往里放文件。"""
+    args = COMMON_ARGS + READ_ACCESS + FS_ARGS + \
+        ["-indev", xpath(dev), "-osirrox", "on:auto_chmod_on"]
+    for p in disc_paths:
+        args += ["-extract", p, xpath(os.path.join(dest, disc_basename(p)))]
+    return args
+
+
+def make_writable(paths: List[str]) -> None:
+    """光盘上的文件常是只读的，取出来以后给当前用户加上写权限，方便修改和删除。"""
+    def fix(p):
+        try:
+            os.chmod(p, os.stat(p).st_mode | 0o200)
+        except OSError:
+            pass
+    for top in paths:
+        fix(top)
+        for root, dirs, files in os.walk(top):
+            for n in dirs + files:
+                fix(os.path.join(root, n))
+
+
 # ---------------------------------------------------------------- 刻录
 
 def check_volid(volid: str) -> Optional[str]:

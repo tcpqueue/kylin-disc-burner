@@ -12,7 +12,8 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from PyQt5.QtWidgets import QApplication, QMessageBox  # noqa: E402
+from PyQt5.QtCore import Qt  # noqa: E402
+from PyQt5.QtWidgets import QApplication, QMessageBox, QTreeWidgetItemIterator  # noqa: E402
 
 from discburner import backend as B  # noqa: E402
 from discburner import gui  # noqa: E402
@@ -117,6 +118,58 @@ def main():
     for p in ("/工作报告.docx", "/项目资料/会议纪要 第三次.doc",
               "/2025-10-25/2025年度预算表（最终版）.xlsx"):
         assert p in paths, (p, paths)
+
+    # 从“光盘现有内容”拖出：镜像文件没有挂载目录，先取到临时目录
+    def select(*disc_paths):
+        win.tree_disc.clearSelection()
+        it = QTreeWidgetItemIterator(win.tree_disc)
+        while it.value():
+            if it.value().data(0, Qt.UserRole) in disc_paths:
+                it.value().setSelected(True)
+            it += 1
+    select("/项目资料", "/项目资料/会议纪要 第三次.doc", "/工作报告.docx")
+    assert win.tree_disc.selected_paths() == ["/工作报告.docx", "/项目资料"]
+    out = win._drag_paths(win.tree_disc.selected_paths())
+    assert [os.path.basename(p) for p in out] == ["工作报告.docx", "项目资料"], out
+    with open(os.path.join(out[1], "会议纪要 第三次.doc")) as f:
+        assert f.read() == "项目资料/会议纪要 第三次.doc" * 100
+    urls = gui.DiscTree.mime_for(out).urls()
+    assert [u.toLocalFile() for u in urls] == out
+    # 真正的拖动要鼠标，这里换掉 QDrag，只核对交给文件管理器的内容和动作
+    dragged = []
+
+    class FakeDrag(object):
+        def __init__(self, _source):
+            pass
+
+        def setMimeData(self, mime):
+            dragged.append([os.path.basename(u.toLocalFile()) for u in mime.urls()])
+
+        def exec_(self, actions, default):
+            dragged.append((actions, default))
+            return default
+    real_drag, gui.QDrag = gui.QDrag, FakeDrag
+    try:
+        win.tree_disc.startDrag(Qt.CopyAction)
+    finally:
+        gui.QDrag = real_drag
+    assert dragged == [["工作报告.docx", "项目资料"], (Qt.CopyAction, Qt.CopyAction)], dragged
+
+    # 右键“复制到…”
+    real_open = B.open_folder
+    B.open_folder = lambda p: True
+    try:
+        dest = os.path.join(tmp, "取出")
+        os.makedirs(dest)
+        select("/2025-10-25")
+        win.copy_out(dest)
+        wait(app, win)
+        got = os.path.join(dest, "2025-10-25", "2025年度预算表（最终版）.xlsx")
+        assert os.path.exists(got), os.listdir(dest)
+        assert os.access(got, os.W_OK)
+        assert win.lb_stage.text() == "复制完成", win.lb_stage.text()
+    finally:
+        B.open_folder = real_open
 
     # 替换同名文件时应提示
     win.ed_target.setText("/")

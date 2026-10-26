@@ -214,6 +214,27 @@ class DiagParseTests(unittest.TestCase):
             os.unlink(f.name)
         self.assertEqual(B.scan_vrs("/nonexistent/x"), [])
 
+    def test_copy_out_helpers(self):
+        self.assertEqual(B.top_level(["/a/b.txt", "/a", "/c", "/ab", "/c/d/e"]), ["/a", "/ab", "/c"])
+        self.assertEqual(B.disc_basename("/项目资料/会议纪要.doc"), "会议纪要.doc")
+        self.assertEqual(B.disc_basename("/项目资料/"), "项目资料")
+        s = " ".join(B.extract_args(DEV, ["/a.doc"], "/home/u/取出"))
+        self.assertIn("-drive_access shared:readonly", s)
+        self.assertIn("-osirrox on:auto_chmod_on", s)
+
+    def test_local_paths_from_mount(self):
+        mnt = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, mnt)
+        os.makedirs(os.path.join(mnt, "项目资料"))
+        real = B.mount_info
+        B.mount_info = lambda dev: (mnt, "iso9660", "ro")
+        try:
+            self.assertEqual(B.local_paths(DEV, ["/项目资料"]), [os.path.join(mnt, "项目资料")])
+            self.assertIsNone(B.local_paths(DEV, ["/项目资料", "/没有这个"]))   # 对不上就不用挂载目录
+            self.assertIsNone(B.local_paths("/tmp/x.iso", ["/项目资料"]))      # 镜像文件不看挂载
+        finally:
+            B.mount_info = real
+
     def test_unescape_mount(self):
         self.assertEqual(B._unescape_mount("/media/u/My\\040Disc"), "/media/u/My Disc")
 
@@ -579,6 +600,21 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("/项目资料/会议纪要 第三次.doc", files)
         self.assertIn("/追加/" + name, files)
         self.assertIn("/it's 文件 (1).txt", files)
+
+    def test_extract(self):
+        """从盘上取出文件和整个文件夹（不挂载），名字、内容不变，取出来的可写。"""
+        self._burn([(os.path.join(self.src, "工作报告.docx"), "/工作报告.docx"),
+                    (os.path.join(self.src, "项目资料"), "/项目资料")])
+        dest = os.path.join(self.tmp, "取出")
+        os.makedirs(dest)
+        code, out = B.run_xorriso(B.extract_args(self.iso, ["/工作报告.docx", "/项目资料"], dest))
+        self.assertEqual(code, 0, out)
+        got = os.path.join(dest, "项目资料", "会议纪要 第三次.doc")
+        with open(got, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "b" * 5000)
+        self.assertTrue(os.path.exists(os.path.join(dest, "工作报告.docx")))
+        B.make_writable([os.path.join(dest, "项目资料")])
+        self.assertTrue(os.access(got, os.W_OK))
 
     def test_close_disc(self):
         self._burn([(os.path.join(self.src, "工作报告.docx"), "/a.docx")], close=True)

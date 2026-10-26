@@ -2,17 +2,21 @@
 """光盘刻录助手 图形界面（PyQt5，麒麟 V10 自带 python3-pyqt5）。"""
 
 import datetime
+import getpass
 import html
 import os
+import shutil
 import sys
+import tempfile
 import time
 
-from PyQt5.QtCore import QObject, QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal, qVersion
-from PyQt5.QtGui import QFont, QFontDatabase, QIcon
+from PyQt5.QtCore import (QMimeData, QObject, QProcess, QSettings, Qt, QThread, QTimer, QUrl,
+                          pyqtSignal, qVersion)
+from PyQt5.QtGui import QDrag, QFont, QFontDatabase, QIcon
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from . import __version__
@@ -419,6 +423,35 @@ class DropTree(QTreeWidget):
             e.acceptProposedAction()
 
 
+class DiscTree(QTreeWidget):
+    """光盘现有内容。选中的文件可以拖到文件管理器或桌面，相当于复制出来。"""
+
+    def __init__(self, provider, parent=None):
+        super(DiscTree, self).__init__(parent)
+        self.provider = provider   # 盘上路径列表 → 本机路径列表（或 None）
+        self.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragOnly)
+
+    def selected_paths(self):
+        return B.top_level([it.data(0, Qt.UserRole) for it in self.selectedItems()
+                            if it.data(0, Qt.UserRole)])
+
+    @staticmethod
+    def mime_for(paths):
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        return mime
+
+    def startDrag(self, _actions):
+        paths = self.provider(self.selected_paths())
+        if not paths:
+            return
+        drag = QDrag(self)
+        drag.setMimeData(self.mime_for(paths))
+        drag.exec_(Qt.CopyAction, Qt.CopyAction)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
@@ -431,6 +464,7 @@ class MainWindow(QMainWindow):
         self.drives = []
         self.burning = False
         self._remount = ""   # 写入前被卸载、写完要挂回去的设备
+        self._copied = []    # “复制到…”的目标路径，复制完核对用
         self._outdev_retry = False
         # 已经提示过修复的设备，避免每次刷新都弹窗；换盘/弹出后清空
         self._repair_prompted = ""
@@ -491,9 +525,11 @@ class MainWindow(QMainWindow):
 
         # 左：光盘现有内容；右：待刻录
         split = QSplitter(Qt.Horizontal)
-        g_disc = QGroupBox("光盘现有内容")
+        g_disc = QGroupBox("光盘现有内容（可拖出复制）")
         lv = QVBoxLayout(g_disc)
-        self.tree_disc = QTreeWidget()
+        self.tree_disc = DiscTree(self._drag_paths)
+        self.tree_disc.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree_disc.customContextMenuRequested.connect(self._disc_menu)
         self.tree_disc.setHeaderLabels(["名称", "大小"])
         self.tree_disc.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree_disc.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -846,9 +882,97 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(parent, [os.path.basename(e.path),
                                             "" if e.is_dir else B.human_size(e.size)])
             item.setIcon(0, QIcon.fromTheme("folder" if e.is_dir else "text-x-generic"))
+            item.setData(0, Qt.UserRole, e.path)
             if e.is_dir:
                 nodes[e.path] = item
         self.tree_disc.expandToDepth(0)
+
+    # ------------------------------------------------------------ 从光盘复制出来
+
+    def _drag_paths(self, disc_paths):
+        """拖出时交给文件管理器的本机路径。光盘挂载着就直接用挂载目录里的文件；
+        否则（镜像文件、没挂载上）先取到临时目录。"""
+        dev = self.current_dev()
+        if not disc_paths or not dev or dev == IMAGE_ITEM:
+            return None
+        if self.burning:
+            self.lb_stage.setText("正在写入光盘，请等写完再复制")
+            return None
+        local = B.local_paths(dev, disc_paths)
+        if local is None and B.is_drive(dev) and not B.IS_WINDOWS and not B.is_mounted(dev):
+            B.mount_disc(dev)   # 和放入光盘时系统自动挂载一样
+            local = B.local_paths(dev, disc_paths)
+        if local is not None:
+            return local
+        dest = self._drag_dir()
+        QApplication.setOverrideCursor(Qt.BusyCursor)
+        self.lb_stage.setText("正在从光盘取出文件……")
+        QApplication.processEvents()
+        try:
+            code, out = B.run_xorriso(B.extract_args(dev, disc_paths, dest), timeout=3600)
+        finally:
+            QApplication.restoreOverrideCursor()
+        paths = [os.path.join(dest, B.disc_basename(p)) for p in disc_paths]
+        paths = [p for p in paths if os.path.exists(p)]
+        B.make_writable(paths)
+        self.lb_stage.setText("就绪")
+        if code != 0 or not paths:
+            self._log(out)
+            QMessageBox.warning(self, APP_NAME, "从光盘取出文件失败（代码 %d），详见日志。" % code)
+            return None
+        return paths
+
+    def _drag_dir(self):
+        """拖出用的临时目录。文件管理器复制完才算用完，所以不马上删，下次拖出时清掉一小时前的。"""
+        base = os.path.join(tempfile.gettempdir(), "discburner-drag-%s" % getpass.getuser())
+        now = time.time()
+        if os.path.isdir(base):
+            for name in os.listdir(base):
+                p = os.path.join(base, name)
+                try:
+                    if now - os.path.getmtime(p) > 3600:
+                        shutil.rmtree(p, ignore_errors=True)
+                except OSError:
+                    pass
+        os.makedirs(base, exist_ok=True)
+        return tempfile.mkdtemp(dir=base)
+
+    def _disc_menu(self, pos):
+        if not self.tree_disc.selected_paths():
+            return
+        menu = QMenu(self)
+        menu.addAction("复制到…", self.copy_out)
+        menu.exec_(self.tree_disc.viewport().mapToGlobal(pos))
+
+    def copy_out(self, dest=None):
+        dev = self.current_dev()
+        paths = self.tree_disc.selected_paths()
+        if not paths or self.job.running():
+            return
+        if dest is None:
+            dest = QFileDialog.getExistingDirectory(self, "复制到", os.path.expanduser("~"))
+            if not dest:
+                return
+        clash = [B.disc_basename(p) for p in paths
+                 if os.path.exists(os.path.join(dest, B.disc_basename(p)))]
+        if clash and QMessageBox.question(
+                self, APP_NAME, "目标文件夹里已经有同名的：\n%s\n\n覆盖吗？"
+                % "\n".join(clash[:10])) != QMessageBox.Yes:
+            return
+        self._copied = [os.path.join(dest, B.disc_basename(p)) for p in paths]
+        self._run(B.extract_args(dev, paths, dest), self._copy_done, "正在从光盘复制……")
+
+    def _copy_done(self, code, out):
+        copied = [p for p in self._copied if os.path.exists(p)]
+        B.make_writable(copied)
+        if code == 0 and len(copied) == len(self._copied):
+            self.lb_stage.setText("复制完成")
+            if B.open_folder(os.path.dirname(copied[0])) is False:
+                QMessageBox.information(self, APP_NAME, "已复制到 %s" % os.path.dirname(copied[0]))
+        else:
+            self.lb_stage.setText("复制失败")
+            self.chk_log.setChecked(True)
+            QMessageBox.critical(self, APP_NAME, "复制失败（代码 %d），详见日志。" % code)
 
     # ------------------------------------------------------------ 待刻录列表
 

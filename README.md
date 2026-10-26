@@ -114,7 +114,7 @@ D:\
 </tr>
 </table>
 
-此外还有：一键挂载 UDF 光盘、检测并关闭 Windows 遗留的未关闭会话、生成 ISO 镜像文件、擦除可擦写光盘、写入卡住提醒等。
+此外还有：把光盘里的文件直接拖出来复制、一键挂载 UDF 光盘、检测并关闭 Windows 遗留的未关闭会话、生成 ISO 镜像文件、擦除可擦写光盘、写入卡住提醒等。
 
 <details>
 <summary><b>更多截图</b></summary>
@@ -152,7 +152,7 @@ D:\
 
 ```bash
 # 1. 安装（不需要联网）
-sudo dpkg -i discburner_1.5.2_arm64.deb
+sudo dpkg -i discburner_1.6.0_arm64.deb
 
 # 2. 自检（不用光驱，几秒钟），看到“自检通过”即可
 discburner --selftest ~/自检.iso
