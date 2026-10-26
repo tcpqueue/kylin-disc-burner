@@ -45,13 +45,18 @@ LIBCDIO_CFLAGS="-I$PFX/include" LIBCDIO_LIBS="-L$PFX/lib -lcdio -liconv -lwinmm"
             --disable-jtethreads >/dev/null
 make -s -j"$(nproc)" >/dev/null 2>&1 || make -j"$(nproc)"
 
-rm -rf "$OUT" && mkdir -p "$OUT"
-cp xorriso/xorriso.exe "$OUT/"
-strip "$OUT/xorriso.exe"
+# 输出布局：bin/ 放程序和 DLL，etc/fstab 是 Cygwin 的挂载配置。
+# Cygwin 把 DLL 所在目录的上一级当成根目录（/），所以 /etc/fstab 就是 $OUT/etc/fstab
+rm -rf "$OUT" && mkdir -p "$OUT/bin" "$OUT/etc"
+cp xorriso/xorriso.exe "$OUT/bin/"
+strip "$OUT/bin/xorriso.exe"
+# noacl：不把 Linux 权限翻译成 NTFS 权限。否则从光盘取出的文件带着 Cygwin 写的
+# “拒绝”项（例如管理员不能执行），其他账户也改不了；加上后和普通文件一样继承文件夹的权限
+echo "none /cygdrive cygdrive binary,noacl,posix=0,user 0 0" > "$OUT/etc/fstab"
 # 带上用到的 Cygwin DLL（cygwin1.dll、cygiconv-2.dll）和打过补丁的 cygcdio-19.dll
 # cygcheck 列出全部依赖，系统自带的（Windows 目录、Windows Kits 等）不带
-for dll in $(PATH="$PFX/bin:$PATH" cygcheck "$OUT/xorriso.exe" | sed 's/^ *//' | grep -i '\\cyg[^\\]*\.dll$'); do
-  cp "$(cygpath -u "$dll")" "$OUT/"
+for dll in $(PATH="$PFX/bin:$PATH" cygcheck "$OUT/bin/xorriso.exe" | sed 's/^ *//' | grep -i '\\cyg[^\\]*\.dll$'); do
+  cp "$(cygpath -u "$dll")" "$OUT/bin/"
 done
-"$OUT/xorriso.exe" -version 2>&1 | head -1
-echo "   Cygwin $(uname -r)，文件：$(cd "$OUT" && ls | tr '\n' ' ')"
+"$OUT/bin/xorriso.exe" -version 2>&1 | head -1
+echo "   Cygwin $(uname -r)，文件：$(cd "$OUT" && ls bin etc | tr '\n' ' ')"

@@ -120,6 +120,7 @@ Windows 版的界面和逻辑与麒麟版是同一套 Python 代码，平台差�
 | 文件权限 | Cygwin 按 NTFS 权限换算出的 Rock Ridge 属性是 `rwxrwx---`、属主是 Windows 用户编号，麒麟普通用户读不了。刻录时用 `-chown_r` / `-chgrp_r` / `-find ... -exec chmod` 统一改成 root、644、755 |
 | 误把硬盘当光驱 | libburn 遇到不认识的 `\\.\X:` 会当成普通文件读写。用 `-drive_class caution '\\\\.\\*'` 让这类地址只要不是刻录机就拒绝 |
 | 卷缓存 | 刻录后对光驱卷发 `FSCTL_DISMOUNT_VOLUME`，Windows 下次访问时重新挂载 |
+| 取出文件的权限 | Cygwin 默认把光盘上的 Linux 权限翻译成 NTFS 权限，写出带“拒绝”项的 ACL。自带的 `xorriso\etc\fstab` 给 `/cygdrive` 加了 `noacl`，取出的文件按 Windows 方式继承文件夹权限。Cygwin 把 DLL 所在目录的上一级当根目录，所以程序和 DLL 放在 `xorriso\bin` |
 | 字体发虚 | Qt 在 Windows 上默认用 GDI 画字，中文笔画细、对比度低。改用 FreeType（`QT_QPA_PLATFORM=windows:fontengine=freetype`，自己设了这个环境变量时以设置的为准），微软雅黑 10 号 |
 | 无控制台 | 绿色版是窗口程序，`--selftest` 的结果用对话框显示；调用 xorriso 时不弹出黑窗口 |
 | Windows 7 | Cygwin 从 3.5 版起不支持 Win7，xorriso 用 Cygwin 3.4.10 编译；Python 用 3.8（最后支持 Win7 的版本）；随程序带上 UCRT。打包脚本用 `check_win7.py` 扫描导入表把关 |

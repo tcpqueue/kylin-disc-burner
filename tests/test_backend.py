@@ -7,6 +7,7 @@
 
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -568,7 +569,11 @@ class IntegrationTests(unittest.TestCase):
         self.iso = os.path.join(self.tmp, "disc.iso")
 
     def tearDown(self):
-        shutil.rmtree(self.tmp)
+        # 从没有 Rock Ridge 的会话取出的文件是只读的（Windows 上就是“只读”属性），先去掉再删
+        def force(func, path, _exc):
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        shutil.rmtree(self.tmp, onerror=force)
 
     def _w(self, rel, data):
         with open(os.path.join(self.src, rel), "w", encoding="utf-8") as f:

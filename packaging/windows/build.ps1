@@ -5,7 +5,7 @@
 #       -Xorriso C:\discburner-build\xorriso -Src C:\discburner-build\src
 #
 #   -Python   装好 PyQt5 5.15、PyInstaller 5.13、pefile 的 Python 3.8（64 位）
-#   -Xorriso  build_xorriso.sh 的输出目录（xorriso.exe 和几个 Cygwin DLL）。
+#   -Xorriso  build_xorriso.sh 的输出目录（bin\ 下是 xorriso.exe 和几个 Cygwin DLL，etc\fstab）。
 #             要支持 Windows 7，必须用 Cygwin 3.4.10 编译（3.5 起不支持 Win7）
 #   -Src      xorriso、libcdio 源码包所在目录，一起放进 zip
 #   -Work     临时目录。要用短路径：Qt 的 DLL 层级深，整条路径超过 260 个字符就加载不了
@@ -30,7 +30,7 @@ if (Test-Path $Work) { Remove-Item -Recurse -Force $Work }
 New-Item -ItemType Directory -Force $Work, $Dist | Out-Null
 
 Write-Host "== 单元测试"
-$env:DISCBURNER_XORRISO = Join-Path $Xorriso "xorriso.exe"
+$env:DISCBURNER_XORRISO = Join-Path $Xorriso "bin\xorriso.exe"
 # 用 cmd 转一下：PowerShell 5.1 会把原生程序写到 stderr 的内容当成错误
 cmd /c "`"$Python`" -B -m unittest discover -s tests 2>&1" | Select-Object -Last 3 | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "单元测试失败" }
@@ -81,12 +81,13 @@ Copy-Item "$Proj\LICENSE" (Join-Path $App "LICENSE.txt")
 $readme = (Get-Content -Raw -Encoding UTF8 "$Here\README.txt").Replace("{VERSION}", $Version).Replace("`n", "`r`n")
 [IO.File]::WriteAllText((Join-Path $App "README.txt"), $readme, (New-Object Text.UTF8Encoding $true))
 
-$cygver = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $Xorriso "cygwin1.dll")).ProductVersion
+if (-not (Test-Path (Join-Path $Xorriso "etc\fstab"))) { throw "$Xorriso 里没有 etc\fstab，请用新版 build_xorriso.sh 重新编译" }
+$cygver = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $Xorriso "bin\cygwin1.dll")).ProductVersion
 $SrcOut = New-Item -ItemType Directory -Force (Join-Path $App "source")
 Copy-Item (Get-ChildItem $Src -Include "xorriso-*.tar.gz", "libcdio-*.tar.bz2" -Recurse) $SrcOut
 Copy-Item "$Here\*.patch", "$Here\build_xorriso.sh" $SrcOut
 @"
-xorriso\ 目录里程序的来源
+xorriso\bin 目录里程序的来源
 ========================
 
 xorriso.exe      GNU xorriso（libburnia 项目），源码：$(Split-Path -Leaf (Get-ChildItem $Src -Filter "xorriso-*.tar.gz" | Select-Object -First 1))
@@ -100,6 +101,7 @@ cygiconv-2.dll   GNU libiconv（LGPL），未修改
                  官方镜像只保留最新几个版本；3.4.x 等旧版本在 Cygwin Time Machine 存档里：
                  http://www.crouchingtigerhiddenfruitbat.org/Cygwin/timemachine.html
 
+xorriso\etc\fstab 是 Cygwin 的挂载配置（noacl：从光盘取出的文件按 Windows 的方式继承权限）。
 编译方法见 build_xorriso.sh。源码和补丁都在绿色版 zip 的 source 目录里，
 也可以在项目主页取得：https://github.com/tcpqueue/kylin-disc-burner
 "@ | Set-Content -Encoding UTF8 (Join-Path $SrcOut "SOURCES.txt")
@@ -129,7 +131,7 @@ Write-Host "已生成 $zip（$size）"
 Write-Host "== PyInstaller（单文件版）"
 # xorriso 和许可证、源码说明一起打进 exe，运行时解压到临时目录（sys._MEIPASS）
 & $Python "$Here\pyinstaller_dpi.py" @PyiArgs --onefile --name "discburner-$Version-portable" `
-    --add-binary "$Xorriso\*;xorriso" `
+    --add-binary "$Xorriso\bin\*;xorriso\bin" --add-data "$Xorriso\etc\fstab;xorriso\etc" `
     --add-data "$Proj\LICENSE;." --add-data "$SrcOut\SOURCES.txt;." `
     --distpath "$Work\dist1" --workpath "$Work\pyi1" "$Proj\packaging\run.py"
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller（单文件版）失败" }

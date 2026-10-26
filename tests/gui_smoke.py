@@ -134,7 +134,8 @@ def main():
     with open(os.path.join(out[1], "会议纪要 第三次.doc")) as f:
         assert f.read() == "项目资料/会议纪要 第三次.doc" * 100
     urls = gui.DiscTree.mime_for(out).urls()
-    assert [u.toLocalFile() for u in urls] == out
+    # Windows 上 Qt 给的是 C:/... 形式，按同一路径比较
+    assert [os.path.normpath(u.toLocalFile()) for u in urls] == [os.path.normpath(p) for p in out]
     # 真正的拖动要鼠标，这里换掉 QDrag，只核对交给文件管理器的内容和动作
     dragged = []
 
