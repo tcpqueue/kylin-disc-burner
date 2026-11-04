@@ -243,6 +243,45 @@ def main():
     assert messages[-1][0] == "question" and "先挂载 UDF 部分" in messages[-1][1], messages[-1]
     assert "管理员密码" in messages[-1][1]
 
+    # UDF 部分挂着时（Windows 上系统自己就挂着）：刷新后左边列出 UDF 里的文件，
+    # 不用点“光盘诊断”就自动问要不要修复光盘文件系统
+    udf_dir = os.path.join(tmp, "UDF部分")
+    os.makedirs(os.path.join(udf_dir, "项目资料"))
+    with open(os.path.join(udf_dir, "项目资料", "现场照片.jpg"), "w") as f:
+        f.write("udf" * 100)
+    real_mount_info = B.mount_info
+    B.mount_info = lambda dev: (udf_dir, "udf", "ro") if dev == fake_dev else real_mount_info(dev)
+    del messages[:]
+    answer[0] = QMessageBox.No
+    win._fs_prompted = ""
+    try:
+        win._media_done(0, test_backend.TOC_ISO_THEN_UDF)
+        wait(app, win)
+        assert "/项目资料/现场照片.jpg" in {e.path for e in win.disc_entries}, win.disc_entries
+        assert win.btn_fsfix.isVisible()
+        assert messages and messages[0][0] == "question" and "修复" in messages[0][1], messages
+        assert "UDF 里的 1 个文件" in messages[0][1], messages[0]
+        # 只问一次
+        win._media_done(0, test_backend.TOC_ISO_THEN_UDF)
+        wait(app, win)
+        assert len(messages) == 1, messages
+        # 复制 UDF 部分的文件
+        select("/项目资料")
+        dest2 = os.path.join(tmp, "取出2")
+        os.makedirs(dest2)
+        real_open = B.open_folder
+        B.open_folder = lambda p: True
+        win.copy_out(dest2)
+        end = time.time() + 30
+        while win.lb_stage.text() != "复制完成" and time.time() < end:
+            app.processEvents()
+            time.sleep(0.02)
+        B.open_folder = real_open
+        assert os.path.exists(os.path.join(dest2, "项目资料", "现场照片.jpg")), win.lb_stage.text()
+    finally:
+        B.mount_info = real_mount_info
+        answer[0] = QMessageBox.Yes
+
     # 光盘诊断窗口：对镜像文件诊断（镜像不显示挂载/修复按钮）
     dlg = gui.DiagDialog(win, iso)
     dlg.show()
@@ -350,6 +389,19 @@ def main():
     paths = {e.path for e in win.disc_entries}
     assert "/Windows加的/总结.docx" in paths and "/2025年度预算表（最终版）.xlsx" in paths, paths
     assert win._stage is None and os.listdir(gui.STAGE_DIR) == [], os.listdir(gui.STAGE_DIR)
+
+    # “修复光盘文件系统”：不加新文件，只把 UDF 里的文件刻进新的 ISO 会话；待刻录列表不动
+    with open(os.path.join(udf, "Windows加的", "第二份.docx"), "w") as f:
+        f.write("udf2")
+    win.add_paths([os.path.join(src, "工作报告.docx")])
+    pending_before = win.tree_new.topLevelItemCount()
+    del messages[:]
+    win._converting = True
+    win._stage_then_burn(udf, dict(dev=iso, items=[], volid="", close=False))
+    wait(app, win)
+    assert messages and "修复完成" in messages[-1][1], messages
+    assert "/Windows加的/第二份.docx" in {e.path for e in win.disc_entries}
+    assert win.tree_new.topLevelItemCount() == pending_before
 
     print("GUI smoke OK; messages:")
     for k, t in messages:

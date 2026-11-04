@@ -249,6 +249,27 @@ class DiagParseTests(unittest.TestCase):
         self.assertIn("-drive_access shared:readonly", s)
         self.assertIn("-osirrox on:auto_chmod_on", s)
 
+    def test_merge_and_copy(self):
+        iso = [B.DiscEntry("/说明.txt", False, 5), B.DiscEntry("/项目资料", True, 0),
+               B.DiscEntry("/项目资料/计划.txt", False, 3)]
+        udf = [B.DiscEntry("/项目资料", True, 0), B.DiscEntry("/项目资料/计划.txt", False, 9)]
+        merged = {e.path: e.size for e in B.merge_entries(iso, udf)}
+        self.assertEqual(merged, {"/说明.txt": 5, "/项目资料": 0, "/项目资料/计划.txt": 9})
+        # 复制到已有的文件夹里是合并，不是整个换掉
+        src, dest = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, src)
+        self.addCleanup(shutil.rmtree, dest)
+        os.makedirs(os.path.join(src, "项目资料"))
+        os.makedirs(os.path.join(dest, "项目资料"))
+        for d, name, text in ((src, "计划.txt", "新"), (dest, "计划.txt", "旧"), (dest, "说明.txt", "留着")):
+            with open(os.path.join(d, "项目资料", name), "w", encoding="utf-8") as f:
+                f.write(text)
+        self.assertEqual(B.copy_local([os.path.join(src, "项目资料")], dest)[0], 0)
+        got = sorted(os.listdir(os.path.join(dest, "项目资料")))
+        self.assertEqual(got, ["计划.txt", "说明.txt"])
+        with open(os.path.join(dest, "项目资料", "计划.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "新")
+
     def test_local_paths_from_mount(self):
         mnt = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, mnt)

@@ -15,6 +15,7 @@
                              下次还能继续追加。
 """
 
+import atexit
 import getpass
 import os
 import platform
@@ -578,22 +579,53 @@ def walk_mount(root: str) -> List[DiscEntry]:
     return entries
 
 
+def _merge_copy(src: str, target: str) -> None:
+    """复制文件或文件夹；文件夹已存在时合并进去，同名文件覆盖。
+    （Python 3.5 的 copytree 不能往已有的文件夹里复制）"""
+    if not os.path.isdir(src):
+        shutil.copy2(src, target)
+        return
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(src):
+        _merge_copy(os.path.join(src, name), os.path.join(target, name))
+
+
+def merge_entries(iso: List[DiscEntry], udf: List[DiscEntry]) -> List[DiscEntry]:
+    """混合盘的 ISO 部分和 UDF 部分合成一份列表；同一路径以 UDF（后写的）为准。"""
+    by_path = {e.path: e for e in iso}
+    by_path.update({e.path: e for e in udf})
+    return list(by_path.values())
+
+
 def copy_local(srcs: List[str], dest: str) -> Tuple[int, str]:
     """从挂载目录复制到本地（UDF 部分 xorriso 读不了，只能走文件系统）。"""
     done = []
     try:
         for s in srcs:
             target = os.path.join(dest, os.path.basename(s.rstrip(os.sep)))
-            if os.path.isdir(s):
-                if os.path.isdir(target):
-                    shutil.rmtree(target)
-                shutil.copytree(s, target)
-            else:
-                shutil.copy2(s, target)
+            _merge_copy(s, target)
             done.append(target)
     except (OSError, shutil.Error) as e:
         return 1, "%s\n已复制：%s" % (e, "、".join(done) or "无")
     return 0, "已复制 %d 项到 %s" % (len(done), dest)
+
+
+def copy_out(dev: str, iso_paths: List[str], sbsector: Optional[int],
+             local_srcs: List[str], dest: str) -> Tuple[int, str]:
+    """混合盘上复制一批项目：ISO 部分的用 xorriso 取出，UDF 部分的从挂载目录复制。
+    先取 ISO 再复制 UDF，同名时 UDF 的（后写的）为准。"""
+    msgs = []
+    if iso_paths:
+        code, out = run_xorriso(extract_args(dev, iso_paths, dest, sbsector), timeout=3600)
+        if code != 0:
+            return code, out
+        msgs.append(out)
+    if local_srcs:
+        code, out = copy_local(local_srcs, dest)
+        if code != 0:
+            return code, out
+        msgs.append(out)
+    return 0, "\n".join(msgs)
 
 
 def list_disc_files(dev: str) -> List[DiscEntry]:
@@ -1466,25 +1498,71 @@ def mount_udf_session(dev: str, start: int) -> Tuple[Optional[str], str]:
         unmount(dev)
         if mount_info(dev):
             return None, "光盘的 ISO 部分正挂载在 %s 且卸载不掉，请先关闭打开它的窗口。" % m[0]
-    mountpoint = os.path.join("/media", getpass.getuser(), "光盘-UDF")
-    cmd = ["sh", "-c", 'mkdir -p "$1" && shift && exec "$@"', "sh", mountpoint] + \
-        udf_mount_cmd(dev, start, mountpoint)
+    mountpoint = os.path.join("/media", getpass.getuser(), "光盘-UDF-" + os.path.basename(dev))
+    cmd = ["sh", "-c", _UDF_HELPER, "sh", mountpoint, str(start), dev]
     if os.geteuid() != 0:
         pkexec = find_tool("pkexec")
         if not pkexec:
             return None, "系统没有 pkexec，无法以管理员身份挂载。" + manual
         cmd = [pkexec] + cmd
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
-        out = p.stdout.decode("utf-8", "replace").strip()
-    except (OSError, subprocess.SubprocessError) as e:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT)
+        first = p.stdout.readline()      # 等用户输完密码、挂载完成
+    except OSError as e:
         return None, "%s\n\n%s" % (e, manual)
-    m = mount_info(dev)
-    if m:
-        return m[0], out
+    if first.strip() == b"MOUNTED" and mount_info(dev):
+        _UDF_HELPERS[dev] = p
+        return mountpoint, ""
+    out = (first + p.stdout.read()).decode("utf-8", "replace").strip()
+    p.wait()
     if p.returncode in (126, 127) and os.geteuid() != 0:
         out = out or "没有输入管理员密码，或当前用户没有管理员权限。"
     return None, "%s\n\n%s" % (out or "挂载失败", manual)
+
+
+# 以管理员身份挂 UDF 部分：pkexec 起一个 root 的 sh，挂好以后一直等着标准输入。
+# 本程序退出时（不管是正常关闭还是崩溃）管道一断，它就自己卸载、删掉挂载目录，
+# 不会把挂载留在系统里，也不用退出时再输一次密码。
+_UDF_HELPER = r'''
+mkdir -p "$1" || exit 1
+if ! mount -t udf -o "ro,session=$2,iocharset=utf8" "$3" "$1"; then rmdir "$1"; exit 1; fi
+echo MOUNTED
+read _ || true
+umount "$1" 2>/dev/null || umount -l "$1"
+rmdir "$1" 2>/dev/null
+'''
+_UDF_HELPERS = {}   # type: Dict[str, subprocess.Popen]
+_OWN_UDISKS = set()  # 本程序用 udisks 挂上的 UDF 盘，退出时卸掉
+
+
+def release_udf(dev: str) -> bool:
+    """卸掉本程序挂的 UDF 部分。返回是否有要卸的。"""
+    p = _UDF_HELPERS.pop(dev, None)
+    if p is not None:
+        try:
+            p.stdin.close()
+            p.wait(timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return True
+    if dev in _OWN_UDISKS:
+        _OWN_UDISKS.discard(dev)
+        udisksctl = find_tool("udisksctl")
+        if udisksctl and mount_info(dev):
+            subprocess.run([udisksctl, "unmount", "-b", dev], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+        return True
+    return False
+
+
+def release_all_mounts() -> None:
+    """程序退出前调用：本程序挂上的 UDF 全部卸掉。"""
+    for dev in list(_UDF_HELPERS) + list(_OWN_UDISKS):
+        release_udf(dev)
+
+
+atexit.register(release_all_mounts)
 
 
 def mount_disc(dev: str, udf_start: Optional[int] = None) -> Tuple[Optional[str], str]:
@@ -1496,9 +1574,12 @@ def mount_disc(dev: str, udf_start: Optional[int] = None) -> Tuple[Optional[str]
     m = mount_info(dev)
     if udf_start == 0 and not IS_WINDOWS:
         # 整张 UDF 的盘先照常用 udisks 挂（不用密码），挂不上或挂成别的再指定会话
+        if m and m[1] == "udf":
+            return m[0], "已经挂载在 %s" % m[0]
         path, msg = mount_disc(dev)
         m = mount_info(dev)
         if path and m and m[1] == "udf":
+            _OWN_UDISKS.add(dev)
             return path, msg
         return mount_udf_session(dev, 0)
     if m:
@@ -1560,7 +1641,9 @@ def unmount(dev: str) -> None:
     只读不用卸载（见 READ_ACCESS）。Windows 下光驱挂载着也能刻录，不用处理。"""
     if IS_WINDOWS or not dev.startswith("/dev/") or not is_mounted(dev):
         return
-    # 最后一条：以管理员身份挂上的 UDF 部分（mount_udf_session），普通用户卸不掉
+    if release_udf(dev) and not is_mounted(dev):
+        return
+    # 最后一条：以前的版本以管理员身份挂上、没卸掉的 UDF 部分，普通用户卸不掉
     ours = "session=" in (mount_info(dev) or ("", "", ""))[2]
     for cmd in (["udisksctl", "unmount", "-b", dev, "--no-user-interaction"],
                 ["umount", dev], ["pkexec", "umount", dev]):
