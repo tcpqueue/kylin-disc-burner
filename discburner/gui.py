@@ -138,6 +138,7 @@ class DiagDialog(QDialog):
         self.dev = dev
         self.diag = None
         self.thread = None
+        self.mount_changed = False   # 挂载或卸载过，关掉后主界面要重新读一遍
         self.setWindowTitle("光盘诊断 - %s" % dev)
         self.resize(820, 640)
         v = QVBoxLayout(self)
@@ -218,6 +219,7 @@ class DiagDialog(QDialog):
         busy = getattr(self, "_busy", False)
         d = self.diag
         self.btn_mount.setVisible(bool(d and d.can_mount))
+        self.btn_mount.setText("挂载 UDF 部分并打开" if d and d.udf_start is not None else "挂载并打开")
         self.btn_open.setVisible(bool(d and d.mount))
         self.btn_unmount.setVisible(bool(d and d.mount) and not B.IS_WINDOWS)
         self.btn_repair.setVisible(bool(d and d.media.needs_repair and not d.is_image))
@@ -273,9 +275,12 @@ class DiagDialog(QDialog):
     # 挂载 -----------------------------------------------------------------
 
     def mount(self):
-        self._run("正在挂载……", B.mount_disc, (self.dev,), self._mounted)
+        udf = self.diag.udf_start if self.diag else None
+        text = "正在挂载 UDF 部分……（会弹出输入管理员密码的窗口）" if udf is not None else "正在挂载……"
+        self._run(text, B.mount_disc, (self.dev, udf), self._mounted)
 
     def _mounted(self, result):
+        self.mount_changed = True
         if isinstance(result, Exception):
             result = (None, str(result))
         path, msg = result
@@ -294,6 +299,7 @@ class DiagDialog(QDialog):
         self._run("正在卸载……", B.unmount_disc, (self.dev,), self._unmounted)
 
     def _unmounted(self, result):
+        self.mount_changed = True
         if isinstance(result, Exception):
             result = (False, str(result))
         ok, msg = result
@@ -465,6 +471,7 @@ class MainWindow(QMainWindow):
         self.burning = False
         self._remount = ""   # 写入前被卸载、写完要挂回去的设备
         self._copied = []    # “复制到…”的目标路径，复制完核对用
+        self._tree_sbsector = None   # 左边列的不是最后一个会话时，那个 ISO 会话的起始扇区
         self._outdev_retry = False
         # 已经提示过修复的设备，避免每次刷新都弹窗；换盘/弹出后清空
         self._repair_prompted = ""
@@ -813,6 +820,26 @@ class MainWindow(QMainWindow):
         if self._outdev_retry:
             self.media.tree_unreadable = True
         self.disc_entries = B.parse_lsdl(out) if self.media.has_iso else []
+        self._tree_sbsector = None
+        if self.media.iso_hidden:
+            # 最后一个会话不是 ISO，xorriso 读到的是空目录。UDF 部分挂载着就列挂载目录，
+            # 否则列最后一个 ISO 会话的内容
+            m = B.mount_info(dev) if B.is_drive(dev) else None
+            if m and m[1] == "udf":
+                self.disc_entries = B.walk_mount(m[0])
+            else:
+                self._tree_sbsector = self.media.last_iso_start
+                self._run(B.list_files_args(dev, self._tree_sbsector), self._iso_part_listed,
+                          "正在读取光盘的 ISO 部分……")
+        self._media_shown()
+
+    def _iso_part_listed(self, code, out):
+        self.disc_entries = B.parse_lsdl(out)
+        self._media_shown()
+
+    def _media_shown(self):
+        if self.job.running():
+            return
         self.lb_stage.setText("就绪")
         self._fill_disc_tree()
         self._show_media()
@@ -860,6 +887,14 @@ class MainWindow(QMainWindow):
             if m.needs_repair:
                 text += ("<br><b style='color:#d35400'>此盘有未关闭的会话，所以读不出内容。"
                          "点右上角“修复未关闭会话”即可关闭它，已有数据不受影响。</b>")
+            elif m.iso_hidden:
+                udf = self._tree_sbsector is None
+                text += ("<br><b style='color:red'>这张盘后来又被别的软件（一般是 Windows"
+                         "“类似 USB 闪存驱动器”方式）用 UDF 格式接着写过，%s"
+                         "不能再往这张盘追加，否则那些文件会看不到。</b>"
+                         % ("左边列出的是 UDF 部分的文件。" if udf else
+                            "左边只列出了前面 ISO 部分的文件；后来写的文件在 UDF 部分，"
+                            "点“光盘诊断 → 挂载并打开”读取。"))
             elif m.foreign_data:
                 text += ("<br><b style='color:red'>此盘上的数据不是标准 ISO9660 格式"
                          "（可能是 Windows“类似 USB 闪存驱动器”方式刻录的 UDF 盘），"
@@ -909,7 +944,8 @@ class MainWindow(QMainWindow):
         self.lb_stage.setText("正在从光盘取出文件……")
         QApplication.processEvents()
         try:
-            code, out = B.run_xorriso(B.extract_args(dev, disc_paths, dest), timeout=3600)
+            code, out = B.run_xorriso(B.extract_args(dev, disc_paths, dest, self._tree_sbsector),
+                                      timeout=3600)
         finally:
             QApplication.restoreOverrideCursor()
         paths = [os.path.join(dest, B.disc_basename(p)) for p in disc_paths]
@@ -947,7 +983,8 @@ class MainWindow(QMainWindow):
     def copy_out(self, dest=None):
         dev = self.current_dev()
         paths = self.tree_disc.selected_paths()
-        if not paths or self.job.running():
+        copying = getattr(self, "_copy_thread", None)
+        if not paths or self.job.running() or (copying and copying.isRunning()):
             return
         if dest is None:
             dest = QFileDialog.getExistingDirectory(self, "复制到", os.path.expanduser("~"))
@@ -960,7 +997,23 @@ class MainWindow(QMainWindow):
                 % "\n".join(clash[:10])) != QMessageBox.Yes:
             return
         self._copied = [os.path.join(dest, B.disc_basename(p)) for p in paths]
-        self._run(B.extract_args(dev, paths, dest), self._copy_done, "正在从光盘复制……")
+        local = B.local_paths(dev, paths)
+        if local is not None:
+            # 挂载着就直接按文件复制；UDF 部分 xorriso 读不了，只能这样
+            self._set_busy(True)
+            self.lb_stage.setText("正在从光盘复制……")
+            self._copy_thread = FuncThread(B.copy_local, local, dest)
+            self._copy_thread.done.connect(self._copy_local_done)
+            self._copy_thread.start()
+            return
+        self._run(B.extract_args(dev, paths, dest, self._tree_sbsector), self._copy_done,
+                  "正在从光盘复制……")
+
+    def _copy_local_done(self, result):
+        code, msg = (1, str(result)) if isinstance(result, Exception) else result
+        self._set_busy(False)
+        self._log(msg)
+        self._copy_done(code, msg)
 
     def _copy_done(self, code, out):
         copied = [p for p in self._copied if os.path.exists(p)]
@@ -1095,6 +1148,11 @@ class MainWindow(QMainWindow):
                 self, APP_NAME, "此盘有未关闭的会话，请先点“修复未关闭会话”。")
         if m.closed:
             return QMessageBox.warning(self, APP_NAME, "此盘已封盘，无法再写入。请换一张光盘。")
+        if m.iso_hidden:
+            return QMessageBox.warning(
+                self, APP_NAME, "这张盘后来被别的软件用 UDF 格式接着写过（一般是 Windows"
+                "“类似 USB 闪存驱动器”方式）。再追加的话，新会话会盖住那些文件，已停止。\n\n"
+                "请先用“光盘诊断 → 挂载并打开”把文件复制出来，再刻到新盘上。")
         if m.foreign_data:
             return QMessageBox.warning(
                 self, APP_NAME, "此盘上的数据不是 ISO9660 格式，追加后原内容会不可见，已停止。")
@@ -1221,6 +1279,8 @@ class MainWindow(QMainWindow):
             return QMessageBox.information(self, APP_NAME, "镜像文件还不存在。")
         dlg = DiagDialog(self, dev)
         dlg.exec_()
+        if dlg.mount_changed and not self.job.running():
+            self.refresh_media()    # 挂上了 UDF 部分时，左边改列它的文件
         return dlg
 
     def recover_names(self, dev):

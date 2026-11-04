@@ -129,6 +129,32 @@ ISO session  :   1 ,         0 ,    248638s , 资料盘
 ISO session  :  11 ,    284800 ,      1581s , DATA_20250101
 """
 
+# 真实输出（设备信息已换掉）：本软件刻了第 1 个会话，后来 Windows 用“类似 USB 闪存驱动器”
+# 方式接着写了 4 个 UDF 会话。xorriso 只读最后一个会话，找不到 ISO，就当成空目录 ISOIMAGE
+TOC_ISO_THEN_UDF = """\
+xorriso : NOTE : Loading ISO image tree from LBA 69664
+libisoburn: WARNING : No ISO 9660 image at LBA 69664. Creating blank image.
+Drive current: -indev '/dev/sr0'
+Drive access : shared:readonly
+Media current: DVD+R
+Media status : is written , is appendable
+Media summary: 5 sessions, 61840 data blocks,  121m data, 4342m free
+Volume id    : 'ISOIMAGE'
+Drive type   : vendor 'HL-DT-ST' product 'DVDRAM GP65NB60' revision 'PF00'
+Media current: DVD+R
+Media product: RITEK/F16/49 , Ritek Corp
+Media status : is written , is appendable
+Media blocks :    70032 readable ,  2223024 writable ,  2295104 overall
+TOC layout   : Idx ,  sbsector ,       Size , Volume Id
+ISO session  :   1 ,         0 ,        52s , 光盘2025-10-28
+Other session:   2 ,      2256 ,       208s ,
+Other session:   3 ,      4512 ,     60752s ,
+Other session:   4 ,     67312 ,       304s ,
+Other session:   5 ,     69664 ,       368s ,
+Media summary: 5 sessions, 61840 data blocks,  121m data, 4342m free
+Media nwa    :    72080s
+"""
+
 TOC_EMPTY = """\
 libburn : SORRY : No media detected
 Media current: is not present
@@ -412,6 +438,20 @@ class ParseTests(unittest.TestCase):
         m = B.parse_toc(TOC_FOREIGN)
         self.assertTrue(m.foreign_data)
 
+    def test_iso_then_udf(self):
+        """前面是 ISO、后面是 Windows 的 UDF：不能当成“可追加”，卷标要用 ISO 会话的。"""
+        m = B.parse_toc(TOC_ISO_THEN_UDF)
+        self.assertTrue(m.has_iso and m.iso_hidden and m.foreign_data)
+        self.assertEqual(m.last_iso_start, 0)
+        self.assertEqual(m.volume_id, "光盘2025-10-28")
+        self.assertEqual(m.status_text(), "含其他格式数据（不能追加）")
+        self.assertFalse(B.parse_toc(TOC_APPENDABLE).iso_hidden)
+        self.assertFalse(B.parse_toc(TOC_REAL_APPENDABLE).foreign_data)
+        self.assertIn("-load sbsector 0", " ".join(B.list_files_args(DEV, 0)))
+        self.assertNotIn("-load", " ".join(B.list_files_args(DEV)))
+        s = " ".join(B.udf_mount_cmd("/dev/sr0", 2256, "/mnt/cd"))
+        self.assertEqual(s, "mount -t udf -o ro,session=2256,iocharset=utf8 /dev/sr0 /mnt/cd")
+
     def test_damaged(self):
         m = B.parse_toc(TOC_DAMAGED)
         self.assertTrue(m.damaged and m.needs_repair)
@@ -663,6 +703,33 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(d.vrs, ["BEA01", "NSR03", "TEA01"])
         self.assertEqual(B.udf_revision(img), "2.01")
         self.assertTrue(any("UDF" in t for _, t in d.findings))
+
+    @unittest.skipUnless(shutil.which("mkudffs") and B.find_tool("blkid"), "需要 mkudffs 和 blkid")
+    def test_diagnose_iso_then_udf(self):
+        """做一张和真实问题盘一样的镜像：开头是 ISO 会话，第 2256 扇区起是 UDF。"""
+        self._burn([(os.path.join(self.src, "工作报告.docx"), "/a.docx")], volid="光盘2025-10-28")
+        with open(self.iso, "r+b") as f:
+            f.truncate(8000 * 2048)
+        subprocess.run(["mkudffs", "-b", "2048", "--media-type=hd", "--startblock=2256",
+                        "--bootarea=preserve", "--label=WINUDF", self.iso, "8000"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        self.assertEqual(B.scan_vrs(self.iso)[:1], ["CD001"])           # 开头仍是 ISO
+        self.assertEqual(B.scan_vrs(self.iso, 2256), ["BEA01", "NSR03", "TEA01"])
+        self.assertEqual(B.udf_revision(self.iso, 2256), "2.01")
+
+        real = B.run_xorriso
+        B.run_xorriso = lambda args, timeout=120: (0, TOC_ISO_THEN_UDF)
+        try:
+            d = B.diagnose(self.iso)
+        finally:
+            B.run_xorriso = real
+        self.assertEqual(d.udf_start, 2256, d.report_text())
+        self.assertIn("UDF 2.01（从第 2256 扇区起）", d.fs_text)
+        texts = " ".join(t for _, t in d.findings)
+        self.assertIn("后面 4 个会话是 UDF", texts)
+        self.assertIn("不要再用本软件往这张盘追加", texts)
+        self.assertNotIn("盘片可追加", texts)
+        self.assertNotIn("标准数据盘", texts)
 
     def make_short_name_disc(self):
         """模拟一张典型的问题盘：先像麒麟一样刻一个只有 Rock Ridge、没有 Joliet 的会话，

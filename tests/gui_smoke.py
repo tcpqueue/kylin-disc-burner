@@ -226,6 +226,15 @@ def main():
     assert repaired == [fake_dev], repaired
     assert any("没有做任何改动" in t for k, t in messages), messages
 
+    # 前面是 ISO、后面被 Windows 写成 UDF 的盘：提示 UDF 部分，并且不让追加
+    import test_backend
+    win._media_done(0, test_backend.TOC_ISO_THEN_UDF)
+    wait(app, win)
+    assert "UDF" in win.lb_media.text() and "光盘诊断" in win.lb_media.text(), win.lb_media.text()
+    assert win.media.volume_id == "光盘2025-10-28"
+    win.burn()
+    assert "UDF 格式接着写过" in messages[-1][1], messages[-1]
+
     # 光盘诊断窗口：对镜像文件诊断（镜像不显示挂载/修复按钮）
     dlg = gui.DiagDialog(win, iso)
     dlg.show()

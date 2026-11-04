@@ -15,6 +15,7 @@
                              下次还能继续追加。
 """
 
+import getpass
 import os
 import platform
 import re
@@ -346,6 +347,9 @@ class MediaInfo(object):
         self.sessions = 0          # ISO 会话数
         self.has_iso = False
         self.other_sessions = 0    # 非 ISO9660 的数据轨（如 Windows UDF 实时文件系统）
+        # 最后一个会话不是 ISO9660：xorriso 只读最后一个会话的目录，会当成空盘
+        self.last_other = False
+        self.last_iso_start = None  # type: Optional[int]  最后一个 ISO9660 会话的起始扇区
         self.readable_blocks = 0
         self.writable_blocks = 0
         self.overall_blocks = 0
@@ -393,10 +397,17 @@ class MediaInfo(object):
         return self.present and (self.blank or self.appendable) and not self.needs_repair
 
     @property
+    def iso_hidden(self) -> bool:
+        """前面是 ISO9660，后面又接着写了别的格式（典型：本软件刻过的盘，
+        后来被 Windows 用“类似 USB 闪存驱动器”方式写成 UDF）。"""
+        return self.present and self.has_iso and self.last_other
+
+    @property
     def foreign_data(self) -> bool:
-        """盘上有数据但不是 ISO9660（追加会让原内容在新会话里不可见）。"""
-        return (self.present and not self.blank and not self.has_iso
-                and (self.readable_blocks > 0 or self.other_sessions > 0))
+        """盘上有不是 ISO9660 的数据（追加会让它在新会话里不可见）。"""
+        return self.present and not self.blank and (
+            self.last_other or
+            (not self.has_iso and (self.readable_blocks > 0 or self.other_sessions > 0)))
 
     def status_text(self) -> str:
         if not self.present:
@@ -408,7 +419,7 @@ class MediaInfo(object):
         if self.closed:
             return "已封盘（不可再写入）"
         if self.appendable:
-            return "可追加"
+            return "含其他格式数据（不能追加）" if self.foreign_data else "可追加"
         return self.status or "未知"
 
 
@@ -419,6 +430,7 @@ def _field(line: str) -> str:
 def parse_toc(text: str) -> MediaInfo:
     info = MediaInfo()
     info.raw = text
+    last_iso_volid = ""
     for line in text.splitlines():
         if line.startswith("Media current:"):
             info.profile = _field(line)
@@ -449,8 +461,13 @@ def parse_toc(text: str) -> MediaInfo:
         elif line.startswith("ISO session  :"):
             info.sessions += 1
             info.has_iso = True
+            info.last_other = False
+            m = re.match(r"ISO session\s*:\s*\d+\s*,\s*(\d+)\s*,\s*\d+s\s*,\s*(.*?)\s*$", line)
+            if m:
+                info.last_iso_start, last_iso_volid = int(m.group(1)), m.group(2)
         elif line.startswith("Other session:") or line.startswith("Data track   :"):
             info.other_sessions += 1
+            info.last_other = True
         elif line.startswith("Volume id    :"):
             v = _field(line)
             if len(v) >= 2 and v[0] == v[-1] == "'":
@@ -462,6 +479,9 @@ def parse_toc(text: str) -> MediaInfo:
             info.media_product = _field(line)
     if info.closed:
         info.writable_blocks = 0
+    if info.iso_hidden:
+        # 最后一个会话不是 ISO 时 xorriso 报的卷标是它给空目录起的 ISOIMAGE，不是盘的卷标
+        info.volume_id = last_iso_volid
     return info
 
 
@@ -531,9 +551,49 @@ def parse_lsdl(text: str) -> List[DiscEntry]:
     return entries
 
 
-def list_files_args(dev: str) -> List[str]:
-    return COMMON_ARGS + READ_ACCESS + FS_ARGS + [
+def load_args(sbsector: Optional[int]) -> List[str]:
+    """读指定起始扇区的 ISO 会话，而不是最后一个会话。"""
+    return [] if sbsector is None else ["-load", "sbsector", str(sbsector)]
+
+
+def list_files_args(dev: str, sbsector: Optional[int] = None) -> List[str]:
+    return COMMON_ARGS + READ_ACCESS + FS_ARGS + load_args(sbsector) + [
         "-indev", xpath(dev), "-find", "/", "-exec", "lsdl", "--"]
+
+
+def walk_mount(root: str) -> List[DiscEntry]:
+    """挂载目录里的文件，路径写成盘上的样子（/目录/文件）。UDF 部分只能这样列出来。"""
+    entries = []
+    for top, dirs, files in os.walk(root):
+        rel = os.path.relpath(top, root)
+        base = "" if rel == "." else "/" + rel.replace(os.sep, "/")
+        for n in dirs:
+            entries.append(DiscEntry(base + "/" + n, True, 0))
+        for n in files:
+            try:
+                size = os.path.getsize(os.path.join(top, n))
+            except OSError:
+                size = 0
+            entries.append(DiscEntry(base + "/" + n, False, size))
+    return entries
+
+
+def copy_local(srcs: List[str], dest: str) -> Tuple[int, str]:
+    """从挂载目录复制到本地（UDF 部分 xorriso 读不了，只能走文件系统）。"""
+    done = []
+    try:
+        for s in srcs:
+            target = os.path.join(dest, os.path.basename(s.rstrip(os.sep)))
+            if os.path.isdir(s):
+                if os.path.isdir(target):
+                    shutil.rmtree(target)
+                shutil.copytree(s, target)
+            else:
+                shutil.copy2(s, target)
+            done.append(target)
+    except (OSError, shutil.Error) as e:
+        return 1, "%s\n已复制：%s" % (e, "、".join(done) or "无")
+    return 0, "已复制 %d 项到 %s" % (len(done), dest)
 
 
 def list_disc_files(dev: str) -> List[DiscEntry]:
@@ -565,10 +625,11 @@ def local_paths(dev: str, disc_paths: List[str]) -> Optional[List[str]]:
     return out if all(os.path.exists(p) for p in out) else None
 
 
-def extract_args(dev: str, disc_paths: List[str], dest: str) -> List[str]:
+def extract_args(dev: str, disc_paths: List[str], dest: str,
+                 sbsector: Optional[int] = None) -> List[str]:
     """把光盘上的文件或文件夹取到本地目录 dest 下，不用挂载，镜像文件也行。
     auto_chmod_on：盘上只读的文件夹也能往里放文件。"""
-    args = COMMON_ARGS + READ_ACCESS + FS_ARGS + \
+    args = COMMON_ARGS + READ_ACCESS + FS_ARGS + load_args(sbsector) + \
         ["-indev", xpath(dev), "-osirrox", "on:auto_chmod_on"]
     for p in disc_paths:
         args += ["-extract", p, xpath(os.path.join(dest, disc_basename(p)))]
@@ -836,13 +897,14 @@ def probe_blkid(dev: str) -> Tuple[Dict[str, str], str]:
     return (parse_blkid_udev(out) if p.returncode == 0 else {}), out
 
 
-def scan_vrs(path: str) -> List[str]:
-    """读第 16 扇区起的卷识别序列：CD001=ISO9660，BEA01/NSR02/NSR03/TEA01=UDF。"""
+def scan_vrs(path: str, start: int = 0) -> List[str]:
+    """读会话开头第 16 扇区起的卷识别序列：CD001=ISO9660，BEA01/NSR02/NSR03/TEA01=UDF。
+    start 是会话的起始扇区，默认看盘的开头。"""
     ids = []
     try:
         # Windows 的 \\.\G: 只能按整扇区读
         with open(path, "rb", buffering=0) as f:
-            for sector in range(16, 32):
+            for sector in range(start + 16, start + 32):
                 f.seek(sector * SECTOR)
                 block = f.read(SECTOR)
                 if len(block) < 7:
@@ -858,18 +920,29 @@ def scan_vrs(path: str) -> List[str]:
     return ids
 
 
-def udf_revision(path: str) -> str:
+def udf_revision(path: str, start: int = 0) -> str:
     """从逻辑卷描述符的域标识读 UDF 版本，例如 "2.01"；读不到返回 ""。
-    光盘的块大小是 2048；mkudffs 做的硬盘镜像默认是 512，两种都试。"""
+    光盘的块大小是 2048；mkudffs 做的硬盘镜像默认是 512，两种都试。
+    start：UDF 所在会话的起始扇区（前面还有别的会话时）。"""
     try:
         with open(path, "rb", buffering=0) as f:
-            for bs in (SECTOR, 512):
-                rev = _udf_revision(f, bs)
+            for bs in ((SECTOR,) if start else (SECTOR, 512)):
+                rev = _udf_revision(f, bs, start)
                 if rev:
                     return rev
     except (OSError, struct.error):
         pass
     return ""
+
+
+def find_udf_session(path: str, tracks: List["Track"]) -> Optional[int]:
+    """非 ISO 的会话里第一个以 UDF 卷识别序列开头的，返回它的起始扇区。
+    Windows 实时文件系统每弹出一次都多一个会话，但它们是同一个 UDF，从第一个挂载即可。"""
+    for t in tracks:
+        if t.kind.startswith("Other") and t.start > 0:
+            if any(x in scan_vrs(path, t.start) for x in ("NSR02", "NSR03")):
+                return t.start
+    return None
 
 
 def _read_block(f, bs: int, block: int) -> bytes:
@@ -880,8 +953,8 @@ def _read_block(f, bs: int, block: int) -> bytes:
     return data[pos % SECTOR:pos % SECTOR + bs]
 
 
-def _udf_revision(f, bs: int) -> str:
-    avdp = _read_block(f, bs, 256)          # 锚点卷描述符指针（AVDP）
+def _udf_revision(f, bs: int, start: int = 0) -> str:
+    avdp = _read_block(f, bs, start + 256)  # 锚点卷描述符指针（AVDP），位置从会话开头算
     if len(avdp) < 24 or struct.unpack("<H", avdp[:2])[0] != 2:
         return ""
     length, loc = struct.unpack("<II", avdp[16:24])
@@ -1019,6 +1092,9 @@ class Diagnosis(object):
         self.findings = []        # type: List[Tuple[str, str]]
         self.raw = []             # type: List[Tuple[str, str]]
         self.short_names = []     # type: List[str]  最新目录树里只有短名的文件
+        # 前面是 ISO、后面接着写了 UDF 时，UDF 部分的起始扇区和版本
+        self.udf_start = None     # type: Optional[int]
+        self.udf_version = ""
 
     @property
     def iso_sessions(self) -> int:
@@ -1033,8 +1109,11 @@ class Diagnosis(object):
     @property
     def can_mount(self) -> bool:
         # Windows 自己挂载光盘，认不出文件系统时也没有别的办法挂上
-        return (not IS_WINDOWS and not self.is_image and not self.media.blank
-                and self.mount is None and bool(self.fs_text))
+        if IS_WINDOWS or self.is_image or self.media.blank:
+            return False
+        if self.udf_start is not None:      # 系统挂上的是前面的 ISO 部分时，也要能改挂 UDF 部分
+            return self.mount is None or self.mount[1] != "udf"
+        return self.mount is None and bool(self.fs_text)
 
     def info_rows(self) -> List[Tuple[str, str]]:
         m = self.media
@@ -1117,7 +1196,18 @@ def diagnose(dev: str) -> Diagnosis:
             d.fs, blk = probe_blkid(dev)
             d.raw.append(("blkid -p -o udev", blk))
         d.fs_text = describe_fs(d.fs, d.vrs)
-    if d.media.has_iso:
+        if d.media.last_other:
+            # 盘开头的识别只看到第一个会话；后面的会话要一个个看
+            d.udf_start = find_udf_session(dev, d.tracks)
+            if d.udf_start is not None:
+                d.udf_version = udf_revision(dev, d.udf_start)
+                d.raw.append(("后面会话的卷识别序列（第 %d 扇区起）" % d.udf_start,
+                              " ".join(scan_vrs(dev, d.udf_start))))
+                udf = "UDF %s" % d.udf_version if d.udf_version else "UDF"
+                where = "从第 %d 扇区起" % d.udf_start
+                d.fs_text = ("%s（前面的会话）+ %s（%s）" % (d.fs_text, udf, where)
+                             if d.fs_text else "%s（%s）" % (udf, where))
+    if d.media.has_iso and not d.media.last_other:
         _, cur = run_xorriso(session_files_args(dev), timeout=300)
         d.short_names = sorted(p for p in parse_report_lba(cur) if is_short_name(os.path.basename(p)))
     d.findings = _conclude(d)
@@ -1142,6 +1232,21 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
     if m.blank:
         out.append((INFO, "这是一张空白盘，可以直接刻录。"))
         return out
+    if m.iso_hidden:
+        iso_n = sum(1 for t in d.tracks if t.kind == "ISO session")
+        other_n = sum(1 for t in d.tracks if t.kind.startswith("Other"))
+        if d.udf_start is not None:
+            how = ("Windows 资源管理器里打开的就是 UDF 部分。" if IS_WINDOWS else
+                   "点“挂载并打开”读取 UDF 部分（要输入管理员密码）。")
+            out.append((WARN, "这张盘前 %d 个会话是 ISO9660，后面 %d 个会话是 UDF%s，"
+                              "一般是 Windows 用“类似 USB 闪存驱动器”方式接着写的，后来加的文件都在 UDF 部分里。"
+                              "系统和本软件默认只能读到前面 ISO 部分的内容。%s"
+                              % (iso_n, other_n, "（%s）" % d.udf_version if d.udf_version else "", how)))
+        else:
+            out.append((WARN, "这张盘前 %d 个会话是 ISO9660，后面 %d 个会话是认不出的格式，"
+                              "系统和本软件只能读到前面 ISO 部分的内容。" % (iso_n, other_n)))
+        out.append((WARN, "不要再用本软件往这张盘追加：新写的会话会盖住后面那些文件，"
+                          "Windows 和麒麟上就都看不到了。"))
     fs_type = d.fs.get("type", "")
     is_udf = fs_type == "udf" or (not fs_type and any(x in d.vrs for x in ("NSR02", "NSR03")))
     if is_udf:
@@ -1150,6 +1255,8 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
                               d.fs_text, "可以在资源管理器里直接打开" if IS_WINDOWS else "可以挂载后直接读取")))
         if d.kernel_udf == "missing":
             out.append((ERROR, "系统内核没有 UDF 支持，无法挂载这张盘。请联系管理员。"))
+    elif m.iso_hidden:
+        pass
     elif d.fs_text.startswith("ISO9660"):
         if d.short_names:
             text = ("有 %d 个文件只剩短文件名（如 %s），Windows 和麒麟上都显示成这样。"
@@ -1180,7 +1287,7 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
                            "光驱又把没写完的轨道关掉了。这张盘已无法使用，也无法修复，请换盘。"))
     elif m.closed:
         out.append((INFO, "盘片已封盘，只能读取，不能再写入。"))
-    elif m.appendable and not m.needs_repair and not is_udf:
+    elif m.appendable and not m.needs_repair and not is_udf and not m.foreign_data:
         out.append((OK, "盘片可追加，剩余 %s。" % human_size(m.free_bytes)))
     if d.mount:
         out.append((OK, ("Windows 已识别出这张盘（%s），可以直接打开。" if IS_WINDOWS
@@ -1307,9 +1414,50 @@ def rename_args(dev: str, renames: List[Rename], close: bool = False, fixups=(),
 
 # ---------------------------------------------------------------- 挂载
 
-def mount_disc(dev: str) -> Tuple[Optional[str], str]:
+def udf_mount_cmd(dev: str, start: int, mountpoint: str) -> List[str]:
+    # session= 在 Linux 的 udf 驱动里就是会话的起始扇区
+    return ["mount", "-t", "udf", "-o", "ro,session=%d,iocharset=utf8" % start, dev, mountpoint]
+
+
+def mount_udf_session(dev: str, start: int) -> Tuple[Optional[str], str]:
+    """挂载从第 start 扇区开始的 UDF 部分。前面还有 ISO 会话时系统默认只认出 ISO 部分；
+    udisks 不接受 session= 选项，只能以管理员身份挂载（会弹出输入密码的窗口）。"""
+    manual = ("可以在终端手动挂载：\nsudo mkdir -p /mnt/cd && sudo %s"
+              % " ".join(udf_mount_cmd(dev, start, "/mnt/cd")))
+    m = mount_info(dev)
+    if m and m[1] == "udf":
+        return m[0], "已经挂载在 %s" % m[0]
+    if m:       # 系统挂着前面的 ISO 部分，同一个设备只能挂一个
+        unmount(dev)
+        if mount_info(dev):
+            return None, "光盘的 ISO 部分正挂载在 %s 且卸载不掉，请先关闭打开它的窗口。" % m[0]
+    mountpoint = os.path.join("/media", getpass.getuser(), "光盘-UDF")
+    cmd = ["sh", "-c", 'mkdir -p "$1" && shift && exec "$@"', "sh", mountpoint] + \
+        udf_mount_cmd(dev, start, mountpoint)
+    if os.geteuid() != 0:
+        pkexec = find_tool("pkexec")
+        if not pkexec:
+            return None, "系统没有 pkexec，无法以管理员身份挂载。" + manual
+        cmd = [pkexec] + cmd
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+        out = p.stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "%s\n\n%s" % (e, manual)
+    m = mount_info(dev)
+    if m:
+        return m[0], out
+    if p.returncode in (126, 127) and os.geteuid() != 0:
+        out = out or "没有输入管理员密码，或当前用户没有管理员权限。"
+    return None, "%s\n\n%s" % (out or "挂载失败", manual)
+
+
+def mount_disc(dev: str, udf_start: Optional[int] = None) -> Tuple[Optional[str], str]:
     """用 udisks 挂载（普通用户即可，和文件管理器自动挂载的方式一样）。
-    返回 (挂载点, 说明)；失败时挂载点为 None，说明里带上手动挂载命令。"""
+    返回 (挂载点, 说明)；失败时挂载点为 None，说明里带上手动挂载命令。
+    udf_start：前面是 ISO、后面是 UDF 的盘，挂 UDF 部分。"""
+    if udf_start is not None and not IS_WINDOWS:
+        return mount_udf_session(dev, udf_start)
     m = mount_info(dev)
     if m:
         return m[0], "已经挂载在 %s" % m[0]
@@ -1340,6 +1488,10 @@ def unmount_disc(dev: str) -> Tuple[bool, str]:
         return True, "未挂载"
     unmount(dev)
     m = mount_info(dev)
+    pkexec = find_tool("pkexec")
+    if m and pkexec and not IS_WINDOWS:     # 以管理员身份挂的 UDF 部分，普通用户卸不掉
+        subprocess.run([pkexec, "umount", dev], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        m = mount_info(dev)
     return (m is None), ("已卸载" if m is None else "卸载失败：%s 仍在使用中，请先关闭打开它的窗口。" % m[0])
 
 
