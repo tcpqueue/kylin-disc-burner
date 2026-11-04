@@ -444,7 +444,7 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(m.has_iso and m.iso_hidden and m.foreign_data)
         self.assertEqual(m.last_iso_start, 0)
         self.assertEqual(m.volume_id, "光盘2025-10-28")
-        self.assertEqual(m.status_text(), "含其他格式数据（不能追加）")
+        self.assertEqual(m.status_text(), "可追加（盘上有其他格式的数据）")
         self.assertFalse(B.parse_toc(TOC_APPENDABLE).iso_hidden)
         self.assertFalse(B.parse_toc(TOC_REAL_APPENDABLE).foreign_data)
         self.assertIn("-load sbsector 0", " ".join(B.list_files_args(DEV, 0)))
@@ -473,6 +473,15 @@ class ParseTests(unittest.TestCase):
         self.assertTrue(ok.can_write)
         for good in (TOC_BLANK, TOC_APPENDABLE, TOC_CLOSED, TOC_FOREIGN):
             self.assertFalse(B.parse_toc(good).unfinished)
+
+    def test_hide_args(self):
+        s = " ".join(B.hide_args(DEV, ["/a b.doc", "/目录"], speed="min"))
+        self.assertIn("-close off -rm_r /a b.doc /目录 -- -commit", s)
+        self.assertIn("-speed min", s)
+        a = B.burn_args(DEV, [("/x", "/x")], sbsector=0, normalize=["/x"])
+        self.assertLess(a.index("-load"), a.index("-dev"))
+        if not B.IS_WINDOWS:
+            self.assertIn("-chown_r", a)
 
     def test_reads_do_not_need_unmount(self):
         """只读的命令都以共享只读方式打开光驱：系统挂载着也能读，不用卸载。"""
@@ -594,6 +603,11 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(B.disc_join("备份/2025/", "a.txt"), "/备份/2025/a.txt")
 
 
+def parse_toc_tracks(dev):
+    """镜像里各个 ISO 会话（Track 对象，按起始扇区排）。"""
+    return B.parse_tracks(B.run_xorriso(B.diag_toc_args(dev))[1])
+
+
 @unittest.skipUnless(have_xorriso(), "需要 xorriso")
 class IntegrationTests(unittest.TestCase):
     """对 ISO 文件模拟“第一次刻录 → 追加 → 读回”的完整流程。"""
@@ -645,6 +659,41 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("/项目资料/会议纪要 第三次.doc", files)
         self.assertIn("/追加/" + name, files)
         self.assertIn("/it's 文件 (1).txt", files)
+
+    def test_hide(self):
+        """“删除”只是新会话里不再有：最新目录里看不到，早先的会话里还在，卷标不变。"""
+        self._burn([(os.path.join(self.src, "工作报告.docx"), "/工作报告.docx"),
+                    (os.path.join(self.src, "项目资料"), "/项目资料")], volid="资料盘")
+        first = [t.start for t in parse_toc_tracks(self.iso)]
+        code, out = B.run_xorriso(B.hide_args(self.iso, ["/项目资料"]))
+        self.assertEqual(code, 0, out)
+        files = {e.path for e in B.list_disc_files(self.iso)}
+        self.assertEqual(files, {"/工作报告.docx"})
+        self.assertEqual(B.read_media(self.iso).volume_id, "资料盘")
+        old = {e.path for e in B.parse_lsdl(B.run_xorriso(B.list_files_args(self.iso, first[0]))[1])}
+        self.assertIn("/项目资料/会议纪要 第三次.doc", old)
+
+    def test_burn_on_older_session_with_normalized_perms(self):
+        """往 UDF 盘追加的写法：以前面的 ISO 会话为底，读出来的 UDF 文件统一成 644/755。"""
+        self._burn([(os.path.join(self.src, "工作报告.docx"), "/工作报告.docx")])
+        self._burn([(os.path.join(self.src, "项目资料"), "/项目资料")])
+        first = parse_toc_tracks(self.iso)[0].start
+        staged = os.path.join(self.tmp, "udf")
+        os.makedirs(os.path.join(staged, "Windows加的"))
+        with open(os.path.join(staged, "Windows加的", "总结.docx"), "w") as f:
+            f.write("x")
+        os.chmod(os.path.join(staged, "Windows加的", "总结.docx"), 0o600)
+        os.chmod(os.path.join(staged, "Windows加的"), 0o700)
+        self._burn([(os.path.join(staged, "Windows加的"), "/Windows加的")], sbsector=first,
+                   normalize=["/Windows加的"])
+        files = {e.path for e in B.list_disc_files(self.iso)}
+        self.assertIn("/工作报告.docx", files)                 # 底下那个会话的文件保留
+        self.assertNotIn("/项目资料", files)                    # 以第一个会话为底，第二个会话的不在
+        self.assertIn("/Windows加的/总结.docx", files)
+        _, out = B.run_xorriso(B.list_files_args(self.iso))
+        perms = {B._unquote(l.split("'", 1)[1].rsplit("'", 1)[0]): l.split()[0] for l in out.splitlines()
+                 if "Windows加的" in l and l[:1] in "-d"}
+        self.assertEqual(perms, {"/Windows加的": "drwxr-xr-x", "/Windows加的/总结.docx": "-rw-r--r--"})
 
     def test_extract(self):
         """从盘上取出文件和整个文件夹（不挂载），名字、内容不变，取出来的可写。"""
@@ -727,7 +776,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("UDF 2.01（从第 2256 扇区起）", d.fs_text)
         texts = " ".join(t for _, t in d.findings)
         self.assertIn("后面 4 个会话是 UDF", texts)
-        self.assertIn("不要再用本软件往这张盘追加", texts)
+        self.assertIn("一起刻进一个新的 ISO9660 会话", texts)
         self.assertNotIn("盘片可追加", texts)
         self.assertNotIn("标准数据盘", texts)
 

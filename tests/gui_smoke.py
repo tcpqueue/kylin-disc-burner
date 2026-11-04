@@ -226,14 +226,22 @@ def main():
     assert repaired == [fake_dev], repaired
     assert any("没有做任何改动" in t for k, t in messages), messages
 
-    # 前面是 ISO、后面被 Windows 写成 UDF 的盘：提示 UDF 部分，并且不让追加
+    # 前面是 ISO、后面被 Windows 写成 UDF 的盘：提示 UDF 部分；追加前要先挂上 UDF 部分
     import test_backend
     win._media_done(0, test_backend.TOC_ISO_THEN_UDF)
     wait(app, win)
     assert "UDF" in win.lb_media.text() and "光盘诊断" in win.lb_media.text(), win.lb_media.text()
     assert win.media.volume_id == "光盘2025-10-28"
-    win.burn()
-    assert "UDF 格式接着写过" in messages[-1][1], messages[-1]
+    real_find = B.find_udf_session
+    B.find_udf_session = lambda dev, tracks: 2256
+    answer[0] = QMessageBox.No
+    try:
+        win.burn()
+    finally:
+        B.find_udf_session = real_find
+        answer[0] = QMessageBox.Yes
+    assert messages[-1][0] == "question" and "先挂载 UDF 部分" in messages[-1][1], messages[-1]
+    assert "管理员密码" in messages[-1][1]
 
     # 光盘诊断窗口：对镜像文件诊断（镜像不显示挂载/修复按钮）
     dlg = gui.DiagDialog(win, iso)
@@ -311,6 +319,37 @@ def main():
     win._on_stage(gui.STAGE_WRITING)
     assert win.lb_stage.text() == gui.STAGE_WRITING, win.lb_stage.text()
     win.job, win.burning = real_job, False
+
+    # 回到第一张镜像：右键“从光盘删除（隐藏）”
+    win.cb_drive.setCurrentIndex(win.cb_drive.findData(iso))
+    win.refresh_media()
+    wait(app, win)
+    select("/2025-10-25")
+    del messages[:]
+    answer[0] = QMessageBox.Yes
+    assert win._can_hide()
+    assert win.tree_disc.selected_paths() == ["/2025-10-25"], (
+        win.current_dev(), win.tree_disc.selected_paths(), [e.path for e in win.disc_entries])
+    win.hide_selected()
+    wait(app, win)
+    assert any("已删除 1 项" in t for k, t in messages), messages
+    paths = {e.path for e in win.disc_entries}
+    assert "/工作报告.docx" in paths and not any(p.startswith("/2025-10-25") for p in paths), paths
+
+    # 往 UDF 盘追加的后半段：UDF 里的文件先读到本机，再和这次的文件一起刻进去
+    udf = os.path.join(tmp, "udf挂载点")
+    os.makedirs(os.path.join(udf, "Windows加的"))
+    with open(os.path.join(udf, "Windows加的", "总结.docx"), "w") as f:
+        f.write("udf")
+    del messages[:]
+    win.add_paths([os.path.join(src, "2025年度预算表（最终版）.xlsx")])
+    items = [(s, d) for s, d, _z, _c in win.pending_items()]
+    win._stage_then_burn(udf, dict(dev=iso, items=items, volid="", close=False))
+    wait(app, win)
+    assert messages and messages[-1][0] == "info", messages
+    paths = {e.path for e in win.disc_entries}
+    assert "/Windows加的/总结.docx" in paths and "/2025年度预算表（最终版）.xlsx" in paths, paths
+    assert win._stage is None and os.listdir(gui.STAGE_DIR) == [], os.listdir(gui.STAGE_DIR)
 
     print("GUI smoke OK; messages:")
     for k, t in messages:
