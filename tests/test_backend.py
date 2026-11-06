@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -283,6 +284,37 @@ class DiagParseTests(unittest.TestCase):
         finally:
             B.mount_info = real
 
+    def test_iso_copy_does_not_use_stale_udf_mount(self):
+        with tempfile.TemporaryDirectory() as mount:
+            p = os.path.join(mount, "report.txt")
+            with open(p, "w") as f:
+                f.write("old UDF content")
+            with mock.patch.object(B, "mount_info", return_value=(mount, "UDF", "")):
+                self.assertEqual(B.local_paths(DEV, ["/report.txt"]), [p])
+                self.assertIsNone(B.local_paths(DEV, ["/report.txt"], allow_udf=False))
+
+    def test_udf_history_survives_latest_iso_session(self):
+        media = B.parse_toc(TOC_APPENDABLE)
+        with mock.patch.object(B, "mount_info", return_value=("G:\\", "UDF", "")):
+            self.assertTrue(B.has_udf_history(DEV, media))
+        with mock.patch.object(B, "mount_info", return_value=None), \
+                mock.patch.object(B, "scan_vrs", return_value=["CD001", "NSR03"]):
+            self.assertTrue(B.has_udf_history(DEV, media))
+        media.blank = True
+        self.assertFalse(B.has_udf_history(DEV, media))
+
+    def test_latest_udf_bridge_is_not_confused_with_historical_udf(self):
+        media = B.parse_toc(TOC_APPENDABLE)
+        def historical(path, start=0):
+            return ["NSR03"] if start == 0 else ["CD001"]
+        with mock.patch.object(B, "scan_vrs", side_effect=historical):
+            self.assertFalse(B.is_current_udf_bridge(DEV, media))
+        with mock.patch.object(B, "scan_vrs", return_value=["CD001", "NSR02"]):
+            self.assertTrue(B.is_current_udf_bridge(DEV, media))
+        media.udf_bridge = True
+        self.assertTrue(media.foreign_data)
+        self.assertFalse(media.iso_hidden)
+
     def test_unescape_mount(self):
         self.assertEqual(B._unescape_mount("/media/u/My\\040Disc"), "/media/u/My Disc")
 
@@ -331,6 +363,18 @@ class PlatformTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             B.options_file_text(["-map", "/" + "长" * 8000, "/x"])
 
+    def test_launch_disables_startup_files(self):
+        with mock.patch.object(B, "find_xorriso", return_value="xorriso"):
+            cmd, tmp = B.xorriso_command(["-devices"])
+            try:
+                self.assertEqual(cmd[:2], ["xorriso", "-no_rc"])
+            finally:
+                B.remove_quietly(tmp)
+
+    def test_joliet_length_counts_utf16_units(self):
+        self.assertEqual(B.long_names("𠮷" * 51, limit=103), [])
+        self.assertEqual(B.long_names("𠮷" * 52, limit=103), ["𠮷" * 52])
+
     def test_windows_perm_args(self):
         s = " ".join(B.windows_perm_args(["/资料"]))
         self.assertIn("-chown_r 0 /资料 --", s)
@@ -344,6 +388,41 @@ class PlatformTests(unittest.TestCase):
 
     def test_volid_dash(self):
         self.assertIsNotNone(B.check_volid("-commit"))
+
+
+class NamePlanningTests(unittest.TestCase):
+    def plan(self, names):
+        return B.plan_burn_names([B.DiscEntry("/" + n, False, 1) for n in names], [])
+
+    def test_normal_names_are_unchanged(self):
+        plan = self.plan(["323213516846165.exe", "工作报告.docx"])
+        self.assertEqual(plan.changes, [])
+
+    def test_preserves_extension_and_utf16_boundary(self):
+        for name, ext in (("3" * 110 + ".exe", ".exe"), ("𠮷" * 60 + ".docx", ".docx")):
+            plan = self.plan([name])
+            short = plan.final_paths["/" + name].lstrip("/")
+            self.assertTrue(short.endswith(ext), short)
+            self.assertLessEqual(len(short.encode("utf-16-be")) // 2, 103)
+            self.assertFalse(short.startswith("_"))
+
+    def test_truncation_does_not_overwrite_existing_names(self):
+        existing = "3" * 99 + ".exe"
+        first, second = "3" * 110 + "a.exe", "3" * 110 + "b.exe"
+        plan = self.plan([existing, first, second])
+        finals = [plan.final_paths["/" + n] for n in (existing, first, second)]
+        self.assertEqual(finals[0], "/" + existing)
+        self.assertEqual(len(set(p.casefold() for p in finals)), 3)
+        self.assertTrue(finals[1].endswith(" (2).exe"), finals)
+        self.assertTrue(finals[2].endswith(" (3).exe"), finals)
+
+    def test_cannot_preserve_overlong_extension(self):
+        with self.assertRaises(ValueError):
+            self.plan(["a." + "x" * 103])
+
+    def test_normal_case_collision_requires_manual_resolution(self):
+        with self.assertRaises(ValueError):
+            self.plan(["Report.txt", "report.txt"])
 
 
 class ShortNameTests(unittest.TestCase):
@@ -681,6 +760,92 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("/追加/" + name, files)
         self.assertIn("/it's 文件 (1).txt", files)
 
+    def test_hide_uses_literal_paths(self):
+        for n in ("report[1].txt", "report1.txt", "other.txt"):
+            self._w(n, n)
+        self._burn([(os.path.join(self.src, n), "/" + n)
+                    for n in ("report[1].txt", "report1.txt", "other.txt")])
+        code, out = B.run_xorriso(B.hide_args(self.iso, ["/report[1].txt"]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual({e.path for e in B.list_disc_files(self.iso)},
+                         {"/report1.txt", "/other.txt"})
+
+    def test_verify_uses_literal_paths(self):
+        self._w("report[1].txt", "brackets")
+        self._w("report1.txt", "different data")
+        self._burn([(os.path.join(self.src, n), "/" + n)
+                    for n in ("report[1].txt", "report1.txt")])
+        code, out = B.run_xorriso(B.session_files_args(self.iso))
+        self.assertEqual(code, 0, out)
+        lba, _ = B.parse_report_lba(out)["/report[1].txt"]
+        with open(self.iso, "r+b") as f:
+            f.seek(lba * B.SECTOR)
+            f.write(b"X")
+        code, out = B.run_xorriso(B.COMMON_ARGS + B.FS_ARGS + [
+            "-md5", "on", "-indev", B.xpath(self.iso),
+            "-check_md5_r", "FAILURE", "/report[1].txt", "--"])
+        self.assertNotEqual(code, 0, out)
+        self.assertTrue(B.md5_mismatch(out), out)
+
+    def test_startup_config_is_not_executed(self):
+        home = os.path.join(self.tmp, "home")
+        os.mkdir(home)
+        with open(os.path.join(home, ".xorrisorc"), "w") as f:
+            f.write("-print UNEXPECTED_STARTUP_CONFIG\n-dummy on\n")
+        with mock.patch.dict(os.environ, {"HOME": B.xpath(home)}):
+            code, out = B.run_xorriso(["-status", "long"])
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("UNEXPECTED_STARTUP_CONFIG", out)
+            self.assertIn("-dummy off", out)
+            self.assertTrue(B.xorriso_version(B.find_xorriso()))
+
+    @unittest.skipUnless(B.IS_WINDOWS, "需要 Windows Cygwin 后端")
+    def test_windows_options_path_with_apostrophe(self):
+        for name in ("O'Brien", "O'Brien 中文路径"):
+            scratch = os.path.join(self.tmp, name)
+            os.mkdir(scratch)
+            with mock.patch.object(tempfile, "tempdir", scratch):
+                code, out = B.run_xorriso(["-print", "OPTIONS_PATH_OK"])
+            self.assertEqual(code, 0, out)
+            self.assertIn("OPTIONS_PATH_OK", out)
+            self.assertEqual(os.listdir(scratch), [])
+
+    def test_joliet_preserves_supplementary_characters(self):
+        names = ["报告𠮷.txt", "报告😀.txt"]
+        for name in names:
+            self._w(name, name)
+        self._burn([(os.path.join(self.src, n), "/" + n) for n in names])
+        self.assertEqual(self.joliet_names(self.iso), sorted(names))
+
+    def test_long_names_roundtrip_with_collision_and_nested_directory(self):
+        short = "3" * 99 + ".exe"
+        self._w(short, "original")
+        self._burn([(os.path.join(self.src, short), "/" + short)])
+        entries = B.list_disc_files(self.iso)
+        folder = "目录" + "a" * 110
+        os.mkdir(os.path.join(self.src, folder))
+        long = "3" * 110 + ".exe"
+        self._w(long, "new executable")
+        self._w(folder + "/" + "𠮷" * 60 + ".docx", "nested data")
+        items = [(os.path.join(self.src, n), "/" + n) for n in (long, folder)]
+        plan = B.plan_burn_names(entries, items)
+        self._burn(items, name_plan=plan)
+        self.assertTrue(os.path.isfile(os.path.join(self.src, long)))
+        files = B.list_disc_files(self.iso)
+        self.assertEqual(len([e for e in files if not e.is_dir]), 3)
+        self.assertEqual(B.long_disc_names([e.path for e in files]), [])
+        self.assertEqual(set(self.joliet_names(self.iso)),
+                         {short, plan.final_paths["/" + long].lstrip("/"),
+                          plan.final_paths["/" + folder].lstrip("/")})
+        extracted = os.path.join(self.tmp, "extracted")
+        os.mkdir(extracted)
+        code, out = B.run_xorriso(B.extract_args(self.iso,
+            ["/" + short, plan.final_paths["/" + long]], extracted))
+        self.assertEqual(code, 0, out)
+        for name, data in ((short, "original"), (B.disc_basename(plan.final_paths["/" + long]), "new executable")):
+            with open(os.path.join(extracted, name), encoding="utf-8") as f:
+                self.assertEqual(f.read(), data)
+
     def test_hide(self):
         """“删除”只是新会话里不再有：最新目录里看不到，早先的会话里还在，卷标不变。"""
         self._burn([(os.path.join(self.src, "工作报告.docx"), "/工作报告.docx"),
@@ -797,7 +962,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("UDF 2.01（从第 2256 扇区起）", d.fs_text)
         texts = " ".join(t for _, t in d.findings)
         self.assertIn("后面 4 个会话是 UDF", texts)
-        self.assertIn("一起刻进一个新的 ISO9660 会话", texts)
+        self.assertIn("再换空白光盘", texts)
         self.assertNotIn("盘片可追加", texts)
         self.assertNotIn("标准数据盘", texts)
 
