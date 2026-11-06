@@ -37,7 +37,7 @@ xorriso -dev %1 -map "%2" "%3" -volid "%4" -close on  -commit -speed min -eject
 |---|---|---|
 | ISO9660 | 所有系统 | 8.3 大写短名，只允许 `A-Z 0-9 _`，中文变下划线 |
 | Rock Ridge | Linux、macOS | 叠加在 ISO9660 上，长名、权限、符号链接 |
-| Joliet | Windows、Linux、macOS | 另建一棵 UCS-2 目录树，支持中文。标准限制 64 字符，扩展到 103 字符 |
+| Joliet | Windows、Linux、macOS | 另建一棵 Unicode 目录树；启用 UTF-16 以保留扩展汉字。长名上限为 103 个 UTF-16 单元 |
 | UDF | 所有现代系统 | Windows“类似 U 盘”方式和蓝光使用，适合随机写 |
 
 本软件在同一个会话里**同时写 ISO9660、Rock Ridge 和 Joliet**：Linux 读 Rock Ridge，Windows 读 Joliet，各取所需，两边看到的都是原名。
@@ -67,7 +67,7 @@ xorriso -dev %1 -map "%2" "%3" -volid "%4" -close on  -commit -speed min -eject
 | 参数 | 作用 |
 |---|---|
 | `-joliet on` | 写 Joliet 目录树，Windows 显示原名 |
-| `-compliance joliet_long_names:joliet_long_paths` | Joliet 名字最长 103 字符，路径不限 240 字符 |
+| `-compliance joliet_long_names:joliet_long_paths:joliet_utf16` | Joliet 名字最长 103 个 UTF-16 单元，保留扩展汉字，放宽路径长度限制 |
 | `-rockridge on` | 写 Rock Ridge，Linux 显示原名和权限 |
 | `-local_charset UTF-8` | 不受启动环境 locale 影响，中文名不会被转坏 |
 | `-close off`（默认） | 只关闭会话，不封盘 |

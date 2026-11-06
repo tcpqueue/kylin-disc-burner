@@ -240,8 +240,7 @@ def main():
     finally:
         B.find_udf_session = real_find
         answer[0] = QMessageBox.Yes
-    assert messages[-1][0] == "question" and "先挂载 UDF 部分" in messages[-1][1], messages[-1]
-    assert "管理员密码" in messages[-1][1]
+    assert messages[-1][0] == "warn" and "已停止写盘" in messages[-1][1], messages[-1]
 
     # UDF 部分挂着时（Windows 上系统自己就挂着）：刷新后左边列出 UDF 里的文件，
     # 不用点“光盘诊断”就自动问要不要修复光盘文件系统
@@ -259,12 +258,12 @@ def main():
         wait(app, win)
         assert "/项目资料/现场照片.jpg" in {e.path for e in win.disc_entries}, win.disc_entries
         assert win.btn_fsfix.isVisible()
-        assert messages and messages[0][0] == "question" and "修复" in messages[0][1], messages
-        assert "UDF 里的 1 个文件" in messages[0][1], messages[0]
+        assert messages == [], messages
+        assert "复制全部" in win.btn_fsfix.text()
         # 只问一次
         win._media_done(0, test_backend.TOC_ISO_THEN_UDF)
         wait(app, win)
-        assert len(messages) == 1, messages
+        assert messages == [], messages
         # 复制 UDF 部分的文件
         select("/项目资料")
         dest2 = os.path.join(tmp, "取出2")
@@ -399,7 +398,7 @@ def main():
     win._converting = True
     win._stage_then_burn(udf, dict(dev=iso, items=[], volid="", close=False))
     wait(app, win)
-    assert messages and "修复完成" in messages[-1][1], messages
+    assert messages and "ISO 会话已写入" in messages[-1][1], messages
     assert "/Windows加的/第二份.docx" in {e.path for e in win.disc_entries}
     assert win.tree_new.topLevelItemCount() == pending_before
 
