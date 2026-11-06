@@ -52,7 +52,7 @@ Windows 用“类似于 USB 闪存驱动器”方式刻的光盘是 **UDF** 格�
 - 自动使用 UTF-8，中文文件名正常显示；
 - 挂载后直接打开文件管理器。
 
-挂载失败时，程序会给出可以在终端执行的手动挂载命令，例如：
+挂载失败时，程序会说明原因。下面的命令是给管理员排查用的，普通用户不需要：
 
 ```bash
 sudo mkdir -p /mnt/cd && sudo mount -o ro,iocharset=utf8 /dev/sr0 /mnt/cd
@@ -81,7 +81,7 @@ sudo mkdir -p /mnt/cd && sudo mount -o ro,iocharset=utf8 /dev/sr0 /mnt/cd
 - 挂上以后，主界面列表里 ISO 部分和 UDF 部分的文件都有，可以拖出或右键“复制到电脑…”；
 - 含 UDF 的原盘不再追加或改名。真实 DVD+R 上，Windows 可能继续显示旧 UDF，即使新 ISO 会话数据正确也不能保证目录一致。
 
-没有管理员密码时，可以请管理员在终端执行（2256 换成诊断里写的扇区号）：
+读 UDF 部分时会弹出窗口，输入开机密码即可。如果这个账户输入密码也不行（不是管理员账户），可以请管理员在终端执行（2256 换成诊断里写的扇区号）：
 
 ```bash
 sudo mkdir -p /mnt/cd && sudo mount -t udf -o ro,session=2256,iocharset=utf8 /dev/sr0 /mnt/cd

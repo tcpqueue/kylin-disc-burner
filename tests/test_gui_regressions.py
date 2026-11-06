@@ -208,6 +208,25 @@ class GuiRegressionTests(unittest.TestCase):
         self.win._remove_selected()
         self.assertEqual([p.dst for p in self.win.pending], ["/资料/报告.docx"])
 
+    def test_no_drive_permission_offers_password_prompt_not_commands(self):
+        if B.IS_WINDOWS:
+            self.skipTest("只有麒麟需要")
+        dev = self._disc()
+        with mock.patch.object(G.os.path, "exists", return_value=True), \
+                mock.patch.object(G.os, "access", return_value=False):
+            self.win._update_banner()
+        text = self.win.banner.label.text()
+        self.assertIn("开机密码", text)
+        self.assertNotIn("sudo", text)
+        button = self.win.banner.button("授权使用光驱")
+        self.assertIsNotNone(button)
+        with mock.patch.object(B, "grant_cdrom_access", return_value=(True, "")) as grant, \
+                mock.patch.object(G.QMessageBox, "information") as info:
+            button.click()
+        grant.assert_called_once_with()
+        self.assertIn("注销", info.call_args[0][2])
+        self.assertTrue(dev)
+
     def test_burn_without_eject_marks_system_view_stale(self):
         if B.IS_WINDOWS:
             self.skipTest("只有麒麟需要")

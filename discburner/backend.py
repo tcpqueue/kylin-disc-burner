@@ -1460,7 +1460,7 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
         other_n = sum(1 for t in d.tracks if t.kind.startswith("Other"))
         if d.udf_start is not None:
             how = ("Windows 资源管理器里打开的就是 UDF 部分。" if IS_WINDOWS else
-                   "点“挂载并打开”读取 UDF 部分（要输入管理员密码）。")
+                   "点“挂载并打开”读取 UDF 部分（会弹出窗口，输入开机密码即可）。")
             out.append((WARN, "这张盘前 %d 个会话是 ISO9660，后面 %d 个会话是 UDF%s，"
                               "一般是 Windows 用“类似 USB 闪存驱动器”方式接着写的，后来加的文件都在 UDF 部分里。"
                               "系统和本软件默认只能读到前面 ISO 部分的内容。%s"
@@ -1672,9 +1672,8 @@ def udf_mount_cmd(dev: str, start: int, mountpoint: str) -> List[str]:
 
 def mount_udf_session(dev: str, start: int) -> Tuple[Optional[str], str]:
     """挂载从第 start 扇区开始的 UDF 部分。前面还有 ISO 会话时系统默认只认出 ISO 部分；
-    udisks 不接受 session= 选项，只能以管理员身份挂载（会弹出输入密码的窗口）。"""
-    manual = ("可以在终端手动挂载：\nsudo mkdir -p /mnt/cd && sudo %s"
-              % " ".join(udf_mount_cmd(dev, start, "/mnt/cd")))
+    udisks 不接受 session= 选项，只能以管理员身份挂载：系统会弹出窗口，输入开机密码即可。
+    麒麟的桌面用户一般不用 root、也不会用终端，所以提示里不写命令。"""
     m = mount_info(dev)
     if m and m[1] == "udf":
         return m[0], "已经挂载在 %s" % m[0]
@@ -1687,22 +1686,64 @@ def mount_udf_session(dev: str, start: int) -> Tuple[Optional[str], str]:
     if os.geteuid() != 0:
         pkexec = find_tool("pkexec")
         if not pkexec:
-            return None, "系统没有 pkexec，无法以管理员身份挂载。" + manual
+            return None, "系统缺少输入密码授权的组件（pkexec），读不了这部分。" + ASK_ADMIN
         cmd = [pkexec] + cmd
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT)
         first = p.stdout.readline()      # 等用户输完密码、挂载完成
     except OSError as e:
-        return None, "%s\n\n%s" % (e, manual)
+        return None, "读取失败：%s%s" % (e, ASK_ADMIN)
     if first.strip() == b"MOUNTED" and mount_info(dev):
         _UDF_HELPERS[dev] = p
         return mountpoint, ""
     out = (first + p.stdout.read()).decode("utf-8", "replace").strip()
     p.wait()
     if p.returncode in (126, 127) and os.geteuid() != 0:
-        out = out or "没有输入管理员密码，或当前用户没有管理员权限。"
-    return None, "%s\n\n%s" % (out or "挂载失败", manual)
+        return None, ("没有输入开机密码，或者密码不对，可以再试一次。\n\n"
+                      "如果这个账户输入密码也不行（不是管理员账户），请找管理员帮忙。")
+    return None, "读取失败。%s\n\n详细原因：%s" % (ASK_ADMIN, out or "未知")
+
+
+# 失败提示的结尾。用户一般不会用终端，只让他找管理员，不写命令
+ASK_ADMIN = "如果一直不行，请找管理员帮忙（把这段提示拍下来给他看）。"
+
+
+def grant_cdrom_access() -> Tuple[bool, str]:
+    """把当前用户加进 cdrom 组，以后不用密码就能用光驱。会弹出输入开机密码的窗口，
+    要注销重新登录后才生效。"""
+    pkexec = find_tool("pkexec")
+    usermod = find_tool("usermod") or "/usr/sbin/usermod"
+    if not pkexec:
+        return False, "系统缺少输入密码授权的组件（pkexec）。" + ASK_ADMIN
+    try:
+        p = subprocess.run([pkexec, usermod, "-aG", "cdrom", getpass.getuser()],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, "授权失败：%s%s" % (e, ASK_ADMIN)
+    if p.returncode in (126, 127):
+        return False, "没有输入开机密码，或者密码不对，可以再试一次。"
+    if p.returncode != 0:
+        return False, "授权失败。%s\n\n详细原因：%s" % (
+            ASK_ADMIN, p.stdout.decode("utf-8", "replace").strip())
+    return True, ""
+
+
+def drive_permission_problem() -> Optional[str]:
+    """有光驱、但当前用户没有权限打开时，返回光驱的设备名。"""
+    if IS_WINDOWS:
+        return None
+    for d in sorted(glob_dev("sr")):
+        if not os.access(d, os.R_OK | os.W_OK):
+            return d
+    return None
+
+
+def glob_dev(prefix: str) -> List[str]:
+    try:
+        return ["/dev/" + n for n in os.listdir("/dev") if n.startswith(prefix) and n[len(prefix):].isdigit()]
+    except OSError:
+        return []
 
 
 # 以管理员身份挂 UDF 部分：pkexec 起一个 root 的 sh，挂好以后一直等着标准输入。
@@ -1771,23 +1812,21 @@ def mount_disc(dev: str, udf_start: Optional[int] = None) -> Tuple[Optional[str]
     if IS_WINDOWS:
         return None, "Windows 没有识别出这张盘上的文件系统，无法打开。"
     udisksctl = find_tool("udisksctl")
-    manual = ("可以在终端手动挂载：\nsudo mkdir -p /mnt/cd && "
-              "sudo mount -o ro,iocharset=utf8 %s /mnt/cd" % dev)
     if not udisksctl:
-        return None, "系统没有 udisksctl。" + manual
+        return None, "系统没能打开这张光盘（缺少 udisksctl）。" + ASK_ADMIN
     try:
         p = subprocess.run([udisksctl, "mount", "-b", dev], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=120)
         out = p.stdout.decode("utf-8", "replace").strip()
     except (OSError, subprocess.SubprocessError) as e:
-        return None, "%s\n\n%s" % (e, manual)
+        return None, "系统没能打开这张光盘：%s%s" % (e, ASK_ADMIN)
     m = mount_info(dev)
     if m:
         return m[0], out
     hit = re.search(r" at (/.+?)\.?\s*$", out)
     if p.returncode == 0 and hit:
         return hit.group(1), out
-    return None, "%s\n\n%s" % (out or "挂载失败", manual)
+    return None, "系统没能打开这张光盘。%s\n\n详细原因：%s" % (ASK_ADMIN, out or "未知")
 
 
 def unmount_disc(dev: str) -> Tuple[bool, str]:

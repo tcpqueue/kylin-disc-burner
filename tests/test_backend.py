@@ -545,7 +545,8 @@ class MountTests(unittest.TestCase):
         path, msg = B.mount_disc("/dev/sr9")
         self.assertIsNone(path)
         self.assertIn("wrong fs type", msg)
-        self.assertIn("sudo mount", msg)
+        self.assertNotIn("sudo", msg)       # 用户不会用终端，提示里不写命令
+        self.assertIn("管理员", msg)
 
 
 class ParseTests(unittest.TestCase):

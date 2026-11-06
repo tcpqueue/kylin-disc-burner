@@ -281,7 +281,7 @@ class DiagDialog(QDialog):
 
     def mount(self):
         udf = self.diag.udf_start if self.diag else None
-        text = "正在挂载 UDF 部分……（会弹出输入管理员密码的窗口）" if udf is not None else "正在挂载……"
+        text = "正在挂载 UDF 部分……（会弹出窗口，请输入开机密码）" if udf is not None else "正在挂载……"
         self._run(text, B.mount_disc, (self.dev, udf), self._mounted)
 
     def _mounted(self, result):
@@ -588,9 +588,9 @@ class Banner(QFrame):
         self.setVisible(False)
 
     def button(self, text):
-        for i, b in enumerate(self.buttons):
-            if b.isVisible() and b.text() == text:
-                return b
+        for i, (label, _fn) in enumerate(self._actions):
+            if label == text:
+                return self.buttons[i]
         return None
 
 
@@ -997,10 +997,23 @@ class MainWindow(QMainWindow):
                 text += ("<br>系统里有光驱 %s，但无法以刻录方式打开（可能是虚拟光驱，"
                          "或正被其他刻录软件占用）。" % "、".join(B.drive_letter(x) + ":" for x in unknown))
             self.lb_media.setText(text)
+        elif B.drive_permission_problem():
+            self.lb_media.setText("<b>当前账户还没有使用光驱的权限。</b>")
+            self.banner.show_message(
+                B.WARN, "光驱已经连上了，但这个账户还不能用它。点“授权使用光驱”，"
+                        "在弹出的窗口里输入开机密码；然后注销重新登录（或重启电脑），再打开本软件。",
+                [("授权使用光驱", self.grant_drive_access)])
         else:
             self.lb_media.setText(
-                "<b>未找到刻录机。</b>请检查光驱连接；若已连接，确认当前用户有权限访问 "
-                "/dev/sr0（<code>sudo usermod -aG cdrom $USER</code> 后重新登录）。")
+                "<b>未找到刻录机。</b>请检查光驱的数据线和电源是否插好，然后点“刷新”。")
+
+    def grant_drive_access(self):
+        ok, msg = B.grant_cdrom_access()
+        if ok:
+            QMessageBox.information(self, APP_NAME, "已授权。请注销后重新登录（或重启电脑），"
+                                    "再打开本软件就能使用光驱了。")
+        else:
+            QMessageBox.warning(self, APP_NAME, msg)
 
     def _choose_image(self):
         idx = self.cb_drive.findData(IMAGE_ITEM)
@@ -1205,6 +1218,12 @@ class MainWindow(QMainWindow):
         if t:
             transfer_tail = ("转存：原盘的 %d 个文件（%s）已读到电脑上。"
                              % (t["files"], B.human_size(t["size"])))
+        if not B.IS_WINDOWS and B.is_drive(dev) and os.path.exists(dev) and \
+                not os.access(dev, os.R_OK | os.W_OK):
+            return ban.show_message(
+                B.WARN, "光驱已经连上了，但这个账户还不能用它。点“授权使用光驱”，"
+                        "在弹出的窗口里输入开机密码；然后注销重新登录（或重启电脑），再打开本软件。",
+                [("授权使用光驱", self.grant_drive_access)])
         if t and not m.present:
             return ban.show_message(B.INFO, transfer_tail + "请放入一张空白光盘，读出后点“开始刻录”。",
                                     [("取消转存", self.cancel_transfer)])
@@ -1227,7 +1246,7 @@ class MainWindow(QMainWindow):
         if self._udf_unread():
             return ban.show_message(
                 B.WARN, "这张盘上有一部分文件是 Windows 用 UDF 格式写的，系统默认读不到，"
-                        "列表里还缺这部分。点“读出全部文件”（要输入管理员密码）。",
+                        "列表里还缺这部分。点“读出全部文件”，在弹出的窗口里输入开机密码即可。",
                 [("读出全部文件", self._offer_read_all)])
         if m.split:
             system = "Windows 资源管理器" if B.IS_WINDOWS else "麒麟文件管理器"
@@ -1976,7 +1995,8 @@ class MainWindow(QMainWindow):
                 "系统还没有打开它。\n\n现在读出盘上的文件吗？")
         if QMessageBox.question(
                 self, "读出光盘上的全部文件",
-                what + "\n（可能要输入管理员密码；本软件关闭时会自动卸载。）") != QMessageBox.Yes:
+                what + "\n\n接下来会弹出一个窗口，输入开机密码（登录这台电脑用的密码）即可。"
+                "本软件关闭时会自动收尾，不会改动系统。") != QMessageBox.Yes:
             return
         self._mount_udf(dev, start, then)
 
