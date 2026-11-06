@@ -416,9 +416,50 @@ class NamePlanningTests(unittest.TestCase):
         self.assertTrue(finals[1].endswith(" (2).exe"), finals)
         self.assertTrue(finals[2].endswith(" (3).exe"), finals)
 
-    def test_cannot_preserve_overlong_extension(self):
-        with self.assertRaises(ValueError):
-            self.plan(["a." + "x" * 103])
+    def test_overlong_extension_is_truncated_as_a_whole(self):
+        name = "a." + "x" * 103
+        short = self.plan([name]).final_paths["/" + name].lstrip("/")
+        self.assertTrue(short.startswith("a.xxx"), short)
+        self.assertLessEqual(len(short), 103)
+
+    def test_chinese_names_fit_linux_255_bytes(self):
+        # 103 个汉字是 309 字节，麒麟（Linux）的文件名最多 255 字节
+        name = "汉" * 100 + ".docx"
+        short = self.plan([name]).final_paths["/" + name].lstrip("/")
+        self.assertTrue(short.endswith(".docx"), short)
+        self.assertLessEqual(len(short.encode("utf-8")), 255)
+        self.assertEqual(len(short), 83 + len(".docx"))
+        self.assertEqual(B.long_disc_names(["/" + "汉" * 85, "/" + "汉" * 86]), ["/" + "汉" * 86])
+
+    @unittest.skipUnless(os.name == "nt", "Linux 本身就不允许超过 255 字节的文件名")
+    def test_cygwin_aliases_only_split_folders_that_need_it(self):
+        import tempfile
+        root = tempfile.mkdtemp()
+        try:
+            long = "长" * 90 + ".txt"     # 270 字节，Cygwin 打不开
+            os.makedirs(os.path.join(root, "src", "有长名", "下层"))
+            os.makedirs(os.path.join(root, "src", "普通"))
+            for rel in (("有长名", long), ("有长名", "短.txt"), ("有长名", "下层", "x.txt"), ("普通", "y.txt")):
+                with open(os.path.join(root, "src", *rel), "w") as f:
+                    f.write(rel[-1])
+            alias = os.path.join(root, "alias")
+            os.makedirs(alias)
+            src = os.path.join(root, "src")
+            items, exclude, problems = B.cygwin_safe_items(
+                [(os.path.join(src, "有长名"), "/有长名"), (os.path.join(src, "普通"), "/普通")], alias)
+            dsts = {d: s for s, d in items}
+            self.assertEqual(problems, [])
+            self.assertEqual(dsts["/普通"], os.path.join(src, "普通"))          # 不用拆开
+            self.assertEqual(dsts["/有长名/下层"], os.path.join(src, "有长名", "下层"))
+            self.assertTrue(dsts["/有长名"].startswith(alias))                 # 空文件夹占位
+            self.assertTrue(dsts["/有长名/" + long].startswith(alias))
+            with open(dsts["/有长名/" + long]) as f:
+                self.assertEqual(f.read(), long)
+            self.assertTrue(all(len(os.path.basename(s).encode()) <= 255 for s, _d in items))
+            self.assertLess(list(dsts).index("/有长名"), list(dsts).index("/有长名/短.txt"))
+        finally:
+            import shutil
+            shutil.rmtree(root)
 
     def test_normal_case_collision_requires_manual_resolution(self):
         with self.assertRaises(ValueError):
@@ -962,7 +1003,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("UDF 2.01（从第 2256 扇区起）", d.fs_text)
         texts = " ".join(t for _, t in d.findings)
         self.assertIn("后面 4 个会话是 UDF", texts)
-        self.assertIn("再换空白光盘", texts)
+        self.assertIn("转存到新光盘", texts)
         self.assertNotIn("盘片可追加", texts)
         self.assertNotIn("标准数据盘", texts)
 

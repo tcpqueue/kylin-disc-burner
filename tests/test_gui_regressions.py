@@ -65,22 +65,53 @@ class GuiRegressionTests(unittest.TestCase):
         self.assertEqual(self.win.cb_drive.count(), 2)
         refresh.assert_called_once_with()
 
-    def test_staging_preserves_other_active_tasks(self):
+    def _disc(self, **flags):
+        dev = B.windows_dev("Z") if B.IS_WINDOWS else "/dev/sr9"
+        self.win.cb_drive.addItem("disc", dev)
+        self.win.cb_drive.setCurrentIndex(self.win.cb_drive.findData(dev))
+        m = self.win.media
+        m.present = True
+        for k, v in flags.items():
+            setattr(m, k, v)
+        return dev
+
+    def test_transfer_stages_into_own_folder_without_writing(self):
         stage = os.path.join(self.tmp, "stage")
         active = os.path.join(stage, "other-task")
         os.makedirs(active)
         payload = os.path.join(active, "文件.txt")
         with open(payload, "w") as f:
             f.write("another instance is burning this file")
-        with mock.patch.object(G, "STAGE_DIR", stage), mock.patch.object(G, "FuncThread") as thread:
+        dev = self._disc(appendable=True, has_iso=True, udf_history=True)
+        self.win.disc_entries = [B.DiscEntry("/资料", True, 0), B.DiscEntry("/资料/a.txt", False, 3)]
+        self.win._iso_paths = {e.path for e in self.win.disc_entries}
+        with mock.patch.object(G, "STAGE_DIR", stage), \
+                mock.patch.object(G, "FuncThread") as thread, \
+                mock.patch.object(G.QMessageBox, "question", return_value=G.QMessageBox.Yes), \
+                mock.patch.object(self.win, "_run") as run, \
+                mock.patch.object(self.win, "_release_drive") as release:
             thread.return_value.isRunning.return_value = False
-            self.win._stage_then_burn("unused", {})
-            owned = self.win._stage
+            self.win.transfer_to_new_disc()
+            fn, *args = thread.call_args[0]
+            self.assertIs(fn, B.copy_out)
+            self.assertEqual(args[1], ["/资料"])
+            owned = self.win._transfer["stage"]
             self.assertNotEqual(owned, active)
-            self.assertTrue(os.path.exists(payload))
-            self.win._drop_stage()
+            self.assertTrue(owned.startswith(stage))
+            run.assert_not_called()
+            release.assert_not_called()
+            # 读完：读出的文件变成待刻录，原盘弹出
+            os.makedirs(os.path.join(owned, "资料"))
+            with open(os.path.join(owned, "资料", "a.txt"), "w") as f:
+                f.write("abc")
+            with mock.patch.object(G.QMessageBox, "information"), mock.patch.object(B, "unmount"):
+                self.win._transfer_staged((0, "ok"))
+            self.assertEqual([(p.dst, p.transfer) for p in self.win.pending], [("/资料", True)])
+            self.assertEqual(run.call_args[0][0], B.eject_args(dev))
+            self.win.cancel_transfer()
         self.assertFalse(os.path.exists(owned))
         self.assertTrue(os.path.exists(payload))
+        self.assertEqual(self.win.pending, [])
 
     def test_cancel_shortened_names_stops_before_drive_access(self):
         source = os.path.join(self.tmp, "a" * 104 + ".exe")
@@ -111,11 +142,9 @@ class GuiRegressionTests(unittest.TestCase):
         self.assertTrue(os.path.exists(source))
 
     def test_udf_history_blocks_all_original_disc_writes(self):
-        dev = B.windows_dev("Z") if B.IS_WINDOWS else "/dev/sr9"
-        self.win.cb_drive.addItem("disc", dev)
-        self.win.media.present = self.win.media.appendable = self.win.media.has_iso = True
-        self.win.media.udf_history = True
-        with mock.patch.object(G.QMessageBox, "warning"), \
+        dev = self._disc(appendable=True, has_iso=True, udf_history=True)
+        with mock.patch.object(G.QMessageBox, "question", return_value=G.QMessageBox.No) as ask, \
+                mock.patch.object(G.QMessageBox, "warning"), \
                 mock.patch.object(self.win, "_release_drive") as release, \
                 mock.patch.object(self.win, "_run") as run:
             self.win._start_burn(dev, [], "", False)
@@ -123,23 +152,11 @@ class GuiRegressionTests(unittest.TestCase):
             self.assertFalse(self.win._can_hide())
             release.assert_not_called()
             run.assert_not_called()
-
-    def test_udf_conversion_copies_without_writing_original(self):
-        dev = B.windows_dev("Z") if B.IS_WINDOWS else "/dev/sr9"
-        self.win.cb_drive.addItem("disc", dev)
-        self.win.media.present = self.win.media.udf_history = True
-        self.win.disc_entries = [B.DiscEntry("/file.txt", False, 1)]
-        with mock.patch.object(G.QMessageBox, "information"), \
-                mock.patch.object(self.win, "copy_out") as copy, \
-                mock.patch.object(self.win, "_stage_then_burn") as write:
-            self.win.convert_to_iso()
-            copy.assert_called_once_with()
-            write.assert_not_called()
+            self.assertIn("转存到新光盘", ask.call_args[0][2])
 
     def test_bridge_uses_udf_names_instead_of_short_joliet_names(self):
         import test_backend
-        dev = B.windows_dev("Z") if B.IS_WINDOWS else "/dev/sr9"
-        self.win.cb_drive.addItem("disc", dev)
+        dev = self._disc()
         name = "a" * 110 + ".exe"
         with open(os.path.join(self.tmp, name), "w") as f:
             f.write("full UDF name")
@@ -151,25 +168,59 @@ class GuiRegressionTests(unittest.TestCase):
         self.assertIn("/" + name, [e.path for e in self.win.disc_entries])
         self.assertEqual(self.win._udf_start(dev), self.win.media.last_iso_start)
 
-    def test_mount_finishes_reading_before_copying(self):
-        dev = B.windows_dev("Z") if B.IS_WINDOWS else "/dev/sr9"
-        self.win.cb_drive.addItem("disc", dev)
-        m = self.win.media
-        m.present = m.appendable = True
-        m.other_sessions = 1
-        m.udf_history = True
-        self.win._fs_prompted = dev
-        with mock.patch.object(self.win, "_udf_source", return_value=None), \
-                mock.patch.object(self.win, "_offer_udf_mount") as offer, \
+    def test_reading_udf_part_continues_with_the_pending_action(self):
+        self._disc()
+        done = []
+        with mock.patch.object(self.win, "_udf_source", return_value=self.tmp), \
                 mock.patch.object(self.win, "refresh_media") as refresh:
-            self.win.convert_to_iso()
-            ready = offer.call_args[0][1]
-            ready()
+            self.win._mount_then = lambda: done.append("copy")
+            self.win._udf_mounted((self.tmp, ""))
             refresh.assert_called_once_with()
-            with mock.patch.object(self.win, "convert_to_iso") as copy:
-                self.win._media_shown()
-                self.app.processEvents()
-                copy.assert_called_once_with(ask=True)
+        self.win.media.present = False
+        self.win._media_shown()
+        self.app.processEvents()
+        self.assertEqual(done, ["copy"])
+
+    def test_one_list_shows_disc_and_pending_items(self):
+        src = os.path.join(self.tmp, "报告.docx")
+        with open(src, "w") as f:
+            f.write("x")
+        self.win.disc_entries = [B.DiscEntry("/资料", True, 0, 1700000000.0),
+                                 B.DiscEntry("/资料/报告.docx", False, 9, 1700000000.0)]
+        self.win._fill_tree()
+        folder = self.win.tree.topLevelItem(0)
+        folder.setSelected(True)
+        self.assertEqual(self.win._target_folder(), "/资料")
+        self.win.add_paths([src])
+        self.assertEqual(self.win.pending_items()[0][1], "/资料/报告.docx")
+        folder = self.win.tree.topLevelItem(0)
+        kinds = sorted((folder.child(i).data(0, G.ROLE_KIND), folder.child(i).text(3))
+                       for i in range(folder.childCount()))
+        self.assertEqual(kinds, [("disc", "将被新文件替换"), ("pending", G.HINT_REPLACE)])
+        self.assertTrue(folder.child(0).text(2).startswith("20"))
+        # 新建文件夹，再往里放文件；去掉文件夹时里面的也一起去掉
+        self.win.tree.clearSelection()
+        self.win.new_folder("2026-11-06")
+        self.assertEqual(self.win._target_folder(), "/2026-11-06")
+        self.win.add_paths([src])
+        self.assertIn("/2026-11-06/报告.docx", [d for _s, d, _z, _c in self.win.pending_items()])
+        self.win._select_path("/2026-11-06")
+        self.win._remove_selected()
+        self.assertEqual([p.dst for p in self.win.pending], ["/资料/报告.docx"])
+
+    def test_burn_without_eject_marks_system_view_stale(self):
+        if B.IS_WINDOWS:
+            self.skipTest("只有麒麟需要")
+        with mock.patch.object(B, "unmount"), mock.patch.object(B, "mount_disc") as mount, \
+                mock.patch.object(B, "is_mounted", return_value=True):
+            self.win._release_drive("/dev/sr9")
+            self.win._job_finished(0, "")
+            mount.assert_not_called()
+        self.assertIn("/dev/sr9", self.win._stale)
+        self.win.cb_drive.addItem("disc", "/dev/sr9")
+        self.win.cb_drive.setCurrentIndex(self.win.cb_drive.findData("/dev/sr9"))
+        self.win._ejected()
+        self.assertNotIn("/dev/sr9", self.win._stale)
 
     @unittest.skipUnless(os.name == "nt", "需要 Windows Cygwin 后端")
     def test_qprocess_options_path_with_apostrophe(self):

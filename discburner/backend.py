@@ -26,6 +26,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Dict, List, Optional, Tuple
 
 IS_WINDOWS = os.name == "nt"
@@ -411,6 +412,13 @@ class MediaInfo(object):
         return self.present and self.has_iso and self.last_other
 
     @property
+    def split(self) -> bool:
+        """早先的会话是 UDF（一般是 Windows 刻的），后来又追加了只有 ISO9660 的会话：
+        Windows 只显示 UDF 里的文件，麒麟只显示最新 ISO 里的文件。"""
+        return (self.present and self.has_iso and self.udf_history
+                and not self.last_other and not self.udf_bridge)
+
+    @property
     def foreign_data(self) -> bool:
         """盘上有不是 ISO9660 的数据（追加会让它在新会话里不可见）。"""
         return self.present and not self.blank and (
@@ -528,14 +536,33 @@ def read_media(dev: str) -> MediaInfo:
 
 # ---------------------------------------------------------------- 光盘内文件
 
+PART_ISO, PART_UDF = "iso", "udf"
+
+
 class DiscEntry(object):
-    def __init__(self, path: str, is_dir: bool, size: int):
+    """盘上的一项。mtime 是本地时间的时间戳（读不到为 None）；mtime_exact 为 False 时
+    只精确到日（xorriso 对半年以前的文件只列出日期）。part：混合盘上来自 ISO 还是 UDF 部分。"""
+
+    def __init__(self, path: str, is_dir: bool, size: int, mtime: Optional[float] = None,
+                 mtime_exact: bool = True, part: str = PART_ISO):
         self.path = path
         self.is_dir = is_dir
         self.size = size
+        self.mtime = mtime
+        self.mtime_exact = mtime_exact
+        self.part = part
 
     def __repr__(self):
         return "DiscEntry(%r, %r, %r)" % (self.path, self.is_dir, self.size)
+
+
+def format_mtime(mtime: Optional[float], exact: bool = True) -> str:
+    if mtime is None:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M" if exact else "%Y-%m-%d", time.localtime(mtime))
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def _unquote(s: str) -> str:
@@ -543,10 +570,31 @@ def _unquote(s: str) -> str:
     return s.replace("'\"'\"'", "'")
 
 
-_LSDL_RE = re.compile(r"^([-dlbcps])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+.*?'(.*)'\s*$")
+_LSDL_RE = re.compile(r"^([-dlbcps])\S*\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(.*?)\s*'(.*)'\s*$")
+_LSDL_DATE_RE = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(?:(\d{1,2}):(\d{2})|(\d{4}))$")
+_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def parse_lsdl(text: str) -> List[DiscEntry]:
+def _lsdl_time(text: str, now: Optional[float] = None) -> Tuple[Optional[float], bool]:
+    """"Oct 25 17:20"（近半年，不带年份）或 "Mar 14  2025" → (时间戳, 是否精确到分钟)。"""
+    m = _LSDL_DATE_RE.match(text.strip())
+    if not m or m.group(1) not in _MONTHS:
+        return None, True
+    mon, day = _MONTHS.index(m.group(1)) + 1, int(m.group(2))
+    try:
+        if m.group(5):
+            return time.mktime((int(m.group(5)), mon, day, 0, 0, 0, 0, 0, -1)), False
+        now = time.time() if now is None else now
+        year = time.localtime(now).tm_year
+        t = time.mktime((year, mon, day, int(m.group(3)), int(m.group(4)), 0, 0, 0, -1))
+        if t > now + 86400:     # 不带年份的是最近半年内的，晚于今天就是去年
+            t = time.mktime((year - 1, mon, day, int(m.group(3)), int(m.group(4)), 0, 0, 0, -1))
+        return t, True
+    except (OverflowError, ValueError):
+        return None, True
+
+
+def parse_lsdl(text: str, now: Optional[float] = None) -> List[DiscEntry]:
     """解析 `-find / -exec lsdl` 的输出，例如：
     -rw-r--r--    1 1000     1000            2 Oct 25 17:20 '/工作报告.docx'
     """
@@ -555,10 +603,11 @@ def parse_lsdl(text: str) -> List[DiscEntry]:
         m = _LSDL_RE.match(line)
         if not m:
             continue
-        path = _unquote(m.group(3))
+        path = _unquote(m.group(4))
         if path == "/":
             continue
-        entries.append(DiscEntry(path, m.group(1) == "d", int(m.group(2))))
+        mtime, exact = _lsdl_time(m.group(3), now)
+        entries.append(DiscEntry(path, m.group(1) == "d", int(m.group(2)), mtime, exact))
     return entries
 
 
@@ -578,14 +627,16 @@ def walk_mount(root: str) -> List[DiscEntry]:
     for top, dirs, files in os.walk(root):
         rel = os.path.relpath(top, root)
         base = "" if rel == "." else "/" + rel.replace(os.sep, "/")
-        for n in dirs:
-            entries.append(DiscEntry(base + "/" + n, True, 0))
-        for n in files:
+        dirset = set(dirs)
+        for n in dirs + files:
             try:
-                size = os.path.getsize(os.path.join(top, n))
+                st = os.stat(os.path.join(top, n))
+                size, mtime = st.st_size, st.st_mtime
             except OSError:
-                size = 0
-            entries.append(DiscEntry(base + "/" + n, False, size))
+                size, mtime = 0, None
+            is_dir = n in dirset
+            entries.append(DiscEntry(base + "/" + n, is_dir, 0 if is_dir else size, mtime,
+                                     part=PART_UDF))
     return entries
 
 
@@ -598,12 +649,18 @@ def _merge_copy(src: str, target: str) -> None:
     os.makedirs(target, exist_ok=True)
     for name in os.listdir(src):
         _merge_copy(os.path.join(src, name), os.path.join(target, name))
+    try:
+        shutil.copystat(src, target)    # 文件夹的修改时间也保留（转存到新光盘时要用）
+    except OSError:
+        pass
 
 
-def merge_entries(iso: List[DiscEntry], udf: List[DiscEntry]) -> List[DiscEntry]:
-    """混合盘的 ISO 部分和 UDF 部分合成一份列表；同一路径以 UDF（后写的）为准。"""
-    by_path = {e.path: e for e in iso}
-    by_path.update({e.path: e for e in udf})
+def merge_entries(iso: List[DiscEntry], udf: List[DiscEntry],
+                  udf_newer: bool = True) -> List[DiscEntry]:
+    """混合盘的 ISO 部分和 UDF 部分合成一份列表；同一路径以后写的那部分为准。"""
+    older, newer = (iso, udf) if udf_newer else (udf, iso)
+    by_path = {e.path: e for e in older}
+    by_path.update({e.path: e for e in newer})
     return list(by_path.values())
 
 
@@ -621,21 +678,23 @@ def copy_local(srcs: List[str], dest: str) -> Tuple[int, str]:
 
 
 def copy_out(dev: str, iso_paths: List[str], sbsector: Optional[int],
-             local_srcs: List[str], dest: str) -> Tuple[int, str]:
+             local_srcs: List[str], dest: str, udf_newer: bool = True) -> Tuple[int, str]:
     """混合盘上复制一批项目：ISO 部分的用 xorriso 取出，UDF 部分的从挂载目录复制。
-    先取 ISO 再复制 UDF，同名时 UDF 的（后写的）为准。"""
+    先复制早写的那部分，再复制后写的，同名时后写的为准。"""
+    def iso():
+        if not iso_paths:
+            return 0, ""
+        return run_xorriso(extract_args(dev, iso_paths, dest, sbsector), timeout=3600)
+
+    def udf():
+        return copy_local(local_srcs, dest) if local_srcs else (0, "")
     msgs = []
-    if iso_paths:
-        code, out = run_xorriso(extract_args(dev, iso_paths, dest, sbsector), timeout=3600)
+    for step in ((iso, udf) if udf_newer else (udf, iso)):
+        code, out = step()
         if code != 0:
             return code, out
         msgs.append(out)
-    if local_srcs:
-        code, out = copy_local(local_srcs, dest)
-        if code != 0:
-            return code, out
-        msgs.append(out)
-    return 0, "\n".join(msgs)
+    return 0, "\n".join(m for m in msgs if m)
 
 
 def list_disc_files(dev: str) -> List[DiscEntry]:
@@ -748,8 +807,9 @@ def windows_perm_args(dsts: List[str]) -> List[str]:
 def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
               close: bool = False, speed: str = "", verify: bool = True,
               eject: bool = False, fixups=(), sbsector: Optional[int] = None,
-              normalize=(), name_plan=None) -> List[str]:
+              normalize=(), name_plan=None, exclude=()) -> List[str]:
     """items: [(本地路径, 光盘内目标路径), ...]；fixups: 写入前要改的名字（version_fixups）
+    exclude：加文件夹时跳过的本机路径（见 cygwin_safe_items）
 
     对空白盘是首次刻录；对可追加的盘会自动导入原有目录树再写一个新会话，
     新会话里包含新旧全部文件的 Joliet 名，所以旧盘的乱码也会被修正。
@@ -772,6 +832,8 @@ def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
              "-overwrite", "nondir"]
     for r in fixups:
         args += ["-move", r.old, r.new]
+    if exclude:
+        args += ["-not_paths"] + [xpath(p) for p in exclude] + ["--"]
     for src, dst in items:
         args += ["-map", xpath(src), dst]
     if name_plan is not None:
@@ -791,6 +853,63 @@ def burn_args(dev: str, items: List[Tuple[str, str]], volid: str = "",
     if eject:
         args += ["-eject", "all"]
     return args
+
+
+CYGWIN_NAME_MAX = 255
+
+
+def _cygwin_unsafe(name: str) -> bool:
+    return len(name.encode("utf-8", "surrogatepass")) > CYGWIN_NAME_MAX
+
+
+def cygwin_safe_items(items: List[Tuple[str, str]], alias_root: str):
+    """Windows 版的 xorriso 是 Cygwin 程序，名字的 UTF-8 超过 255 字节（约 85 个汉字）就打不开，
+    而 Windows 允许 255 个字符。这样的文件先在 alias_root 里做一个短名字的硬链接
+    （不在同一个盘时复制一份），加到光盘上原来的位置。xorriso 加文件夹时会逐个打开里面的文件，
+    跳不过去，所以含有这种文件的文件夹拆开来加：先建空文件夹，里面的再一项项加。
+    返回 (新的 items, 要跳过的本机路径（现在总是空的）, 处理不了的文件夹)。"""
+    out, problems = [], []
+    count = [0]
+    bad_dirs = set()        # 自己或下面含有超长名字的文件夹
+    empty = os.path.join(alias_root, "empty")
+
+    def alias(path):
+        count[0] += 1
+        ext = os.path.splitext(path)[1]
+        target = os.path.join(alias_root, "f%d%s" % (count[0], "" if _cygwin_unsafe(ext) else ext))
+        try:
+            os.link(path, target)
+        except OSError:
+            shutil.copy2(path, target)
+        return target
+
+    def add(src, dst):
+        name = os.path.basename(src.rstrip("\\/"))
+        if os.path.isdir(src) and not os.path.islink(src):
+            if _cygwin_unsafe(name):
+                problems.append(src)
+            elif os.path.abspath(src) not in bad_dirs:
+                out.append((src, dst))
+            else:
+                os.makedirs(empty, exist_ok=True)
+                out.append((empty, dst))
+                for child in sorted(os.listdir(src)):
+                    add(os.path.join(src, child), posixpath.join(dst, child))
+        elif _cygwin_unsafe(name):
+            out.append((alias(src), dst))
+        else:
+            out.append((src, dst))
+
+    for src, dst in items:
+        if os.path.isdir(src):
+            for top, dirs, files in os.walk(src):
+                if any(_cygwin_unsafe(n) for n in dirs + files):
+                    d = os.path.abspath(top)
+                    while d not in bad_dirs and len(d) >= len(os.path.abspath(src)):
+                        bad_dirs.add(d)
+                        d = os.path.dirname(d)
+        add(src, dst)
+    return out, [], problems
 
 
 def blank_args(dev: str) -> List[str]:
@@ -988,9 +1107,10 @@ def udf_revision(path: str, start: int = 0) -> str:
 
 
 def find_udf_session(path: str, tracks: List["Track"]) -> Optional[int]:
-    """非 ISO 的会话里第一个以 UDF 卷识别序列开头的，返回它的起始扇区。
-    Windows 实时文件系统每弹出一次都多一个会话，但它们是同一个 UDF，从第一个挂载即可。"""
-    for t in tracks:
+    """非 ISO 的会话里最后一个以 UDF 卷识别序列开头的，返回它的起始扇区。
+    Windows 实时文件系统每弹出一次都多一个会话，但后面的会话没有识别序列，它们是同一个 UDF，
+    从开头那个会话挂载即可；盘上有几个互相独立的 UDF 时，最后那个是最新的。"""
+    for t in reversed(tracks):
         if t.kind.startswith("Other"):
             if any(x in scan_vrs(path, t.start) for x in ("NSR02", "NSR03")):
                 return t.start
@@ -1147,8 +1267,14 @@ def is_current_udf_bridge(dev: str, media: MediaInfo) -> bool:
 
 INFO, OK, WARN, ERROR = "info", "ok", "warn", "error"
 
-MIGRATE_HINT = ("请先把全部可读文件复制到本机，再换空白光盘刻录成 ISO9660。"
-                "向含 UDF 的原盘追加 ISO 会话，Windows 仍可能显示旧 UDF 目录，不能当作文件系统转换。")
+MIGRATE_HINT = ("含 UDF 的盘不能再追加：追加的 ISO 会话 Windows 看不到，资源管理器仍显示原来 UDF 里的文件"
+                "（Windows 自带的刻录往这种盘上追加也一样）。要继续加文件，请用主界面的“转存到新光盘”："
+                "先把盘上全部文件读到电脑上，再换一张空白光盘刻成 Windows 和麒麟都能读的格式，原盘不改动。")
+SPLIT_TEXT = ("这张盘先用 UDF 格式刻过（一般是 Windows 刻的），后来又追加了 ISO9660 会话。"
+              "两部分各管各的：Windows 资源管理器只显示早先 UDF 里的文件，麒麟文件管理器只显示后来 ISO 里的文件。"
+              "本软件会把两部分的文件都列出来。")
+BRIDGE_TEXT = ("这是 Windows 自带刻录（“带有 CD/DVD 播放器”方式）写的盘，同时带 ISO9660 和 UDF，"
+               "Windows 和麒麟都能读。")
 
 
 class Diagnosis(object):
@@ -1169,6 +1295,7 @@ class Diagnosis(object):
         # 前面是 ISO、后面接着写了 UDF 时，UDF 部分的起始扇区和版本
         self.udf_start = None     # type: Optional[int]
         self.udf_version = ""
+        self.split = False        # 早先的会话是 UDF、最新的是 ISO：两边系统看到的内容不一样
 
     @property
     def iso_sessions(self) -> int:
@@ -1290,14 +1417,28 @@ def diagnose(dev: str) -> Diagnosis:
     d.media.udf_bridge = is_current_udf_bridge(dev, d.media)
     if d.media.udf_bridge and not d.media.last_other:
         d.udf_start = d.media.last_iso_start
+    m = d.media
+    d.split = bool(m.udf_history and m.has_iso and not m.last_other and not m.udf_bridge)
+    if d.split and not d.is_image:
+        start = find_udf_session(dev, d.tracks)
+        if start is not None:
+            d.udf_start = start
+            d.udf_version = udf_revision(dev, start)
+            udf = "UDF %s" % d.udf_version if d.udf_version else "UDF"
+            d.fs_text = "%s（早先的会话，从第 %d 扇区起）+ ISO9660 + Joliet（后来的会话）" % (udf, start)
     d.findings = _conclude(d)
     return d
 
 
 def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
     m, out = d.media, []
-    if m.udf_history:
-        out.append((WARN, "盘上存在 UDF。Windows 挂载的目录可能与最新 ISO 目录不同，原盘追加已停用。"))
+    if d.split:
+        out.append((WARN, SPLIT_TEXT))
+        out.append((INFO, MIGRATE_HINT))
+    elif m.udf_bridge:
+        out.append((INFO, BRIDGE_TEXT))
+        if m.appendable:
+            out.append((INFO, MIGRATE_HINT))
     if not m.present:
         if not d.fs_text:
             return [(WARN, "没有检测到光盘，或光驱读不出这张盘。")]
@@ -1333,11 +1474,13 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
             out.append((INFO, MIGRATE_HINT))
     fs_type = d.fs.get("type", "")
     is_udf = fs_type == "udf" or (not fs_type and any(x in d.vrs for x in ("NSR02", "NSR03")))
-    if is_udf:
+    if is_udf and m.udf_bridge:
+        pass
+    elif is_udf:
         out.append((INFO, "这是 UDF 格式的盘（%s），一般是 Windows 用“类似 USB 闪存驱动器”方式刻录的。"
                           "%s。" % (d.fs_text, "可以在资源管理器里直接打开" if IS_WINDOWS
                                     else "可以挂载后直接读取")))
-        if m.appendable:
+        if m.appendable and not m.udf_bridge:
             out.append((INFO, MIGRATE_HINT))
         if d.kernel_udf == "missing":
             out.append((ERROR, "系统内核没有 UDF 支持，无法挂载这张盘。请联系管理员。"))
@@ -1353,7 +1496,7 @@ def _conclude(d: Diagnosis) -> List[Tuple[str, str]]:
                 text += "盘上没有更早的会话，原名无法找回。"
             out.append((WARN, text))
         elif m.udf_history:
-            out.append((WARN, "已识别 ISO 目录，但 Windows 可能仍挂载旧 UDF；请复制后换新盘。"))
+            pass
         elif "Joliet" in d.fs_text:
             out.append((OK, "标准数据盘（%s），Windows 和麒麟都能正常读取。" % d.fs_text))
         else:
@@ -1697,6 +1840,31 @@ def unmount(dev: str) -> None:
                 return
 
 
+CDROM_DRIVE_STATUS, CDS_DISC_OK = 0x5326, 4
+
+
+def media_present_quick(dev: str) -> Optional[bool]:
+    """光驱里有没有盘（空白盘也算）。只问光驱状态，不读盘，用来发现放入、取出光盘。
+    判断不了（不是光驱、打不开、正被独占）时返回 None。"""
+    if not is_drive(dev):
+        return None
+    if IS_WINDOWS:
+        from . import winsys
+        letter = drive_letter(dev)
+        return winsys.media_present(letter) if letter else None
+    try:
+        import fcntl
+        fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+    except (ImportError, OSError):
+        return None
+    try:
+        return fcntl.ioctl(fd, CDROM_DRIVE_STATUS, 0) == CDS_DISC_OK
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
 def refresh_system_view(dev: str) -> None:
     """写完光盘后让系统重新读目录。Windows 会一直用旧的卷缓存，要卸下卷让它重新挂载；
     麒麟刻录前已经卸载，下次访问自然是新内容。"""
@@ -1722,23 +1890,39 @@ def local_size(path: str) -> Tuple[int, int]:
     return total, count
 
 
+def local_bytes(path: str) -> int:
+    """实际字节数（显示用；算容量用 local_size）。"""
+    if not os.path.isdir(path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+    total = 0
+    for top, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(top, f))
+            except OSError:
+                pass
+    return total
+
+
 def long_names(path: str, limit: int = JOLIET_NAME_MAX) -> List[str]:
-    """找出超过 Joliet 长度上限的名字（Windows 上会被截断）。"""
+    """找出刻录时要截短的名字：超过 Joliet 上限（Windows），或超过麒麟的 255 字节。"""
     bad = []
     candidates = [path]
     if os.path.isdir(path):
         for root, dirs, files in os.walk(path):
             candidates += [os.path.join(root, n) for n in dirs + files]
     for p in candidates:
-        if len(os.path.basename(p).encode("utf-16-be")) // 2 > limit:
+        if not _name_fits(os.path.basename(p), limit):
             bad.append(p)
     return bad
 
 
 def long_disc_names(paths, limit: int = JOLIET_NAME_MAX) -> List[str]:
     """检查光盘目标路径的每一级名称，不把整条路径长度当作文件名长度。"""
-    return sorted({p for p in paths if any(
-        len(n.encode("utf-16-be")) // 2 > limit for n in p.split("/"))})
+    return sorted({p for p in paths if any(not _name_fits(n, limit) for n in p.split("/"))})
 
 
 class NamePlan(object):
@@ -1752,14 +1936,25 @@ def _utf16_length(name):
     return len(name.encode("utf-16-be")) // 2
 
 
-def _utf16_prefix(name, limit):
-    out, used = [], 0
+# Linux（麒麟）的文件名最长 255 字节，一个汉字占 3 字节，所以最多 85 个汉字。
+# Joliet 的 103 个字符对汉字来说比这个长，两个上限都要满足，两边才都能读出来。
+NAME_MAX_BYTES = 255
+
+
+def _name_fits(name, limit=JOLIET_NAME_MAX):
+    return _utf16_length(name) <= limit and len(name.encode("utf-8", "surrogatepass")) <= NAME_MAX_BYTES
+
+
+def _utf16_prefix(name, limit, max_bytes=NAME_MAX_BYTES):
+    out, used, size = [], 0, 0
     for char in name:
         units = _utf16_length(char)
-        if used + units > limit:
+        nbytes = len(char.encode("utf-8", "surrogatepass"))
+        if used + units > limit or size + nbytes > max_bytes:
             break
         out.append(char)
         used += units
+        size += nbytes
     return "".join(out)
 
 
@@ -1796,26 +1991,27 @@ def plan_burn_names(entries, items, fixups=(), limit=JOLIET_NAME_MAX):
     for parent, children in siblings.items():
         # 短名称先保留，截短的名称不得占用已有名称，Windows 下也不区分大小写重名。
         reserved = {posixpath.basename(p).casefold() for p in children
-                    if _utf16_length(posixpath.basename(p)) <= limit}
+                    if _name_fits(posixpath.basename(p), limit)}
         used = set()
         for path in sorted(children, key=lambda p: (
-                _utf16_length(posixpath.basename(p)) > limit, posixpath.basename(p))):
+                not _name_fits(posixpath.basename(p), limit), posixpath.basename(p))):
             name = posixpath.basename(path)
-            if _utf16_length(name) <= limit and name.casefold() not in used:
+            if _name_fits(name, limit) and name.casefold() not in used:
                 new = name
             else:
-                if _utf16_length(name) <= limit:
+                if _name_fits(name, limit):
                     raise ValueError("Windows 下有不区分大小写的同名项，请先处理：%s" % path)
                 stem, ext = (name, "") if paths[path] else posixpath.splitext(name)
-                if _utf16_length(ext) >= limit:
-                    raise ValueError("扩展名过长，无法保留完整扩展名：%s" % path)
+                if _utf16_length(ext) >= limit or len(ext.encode("utf-8", "surrogatepass")) >= 64:
+                    stem, ext = name, ""      # 很长的“扩展名”多半不是扩展名，整个截短
                 number = 1
                 while True:
                     suffix = "" if number == 1 else " (%d)" % number
                     room = limit - _utf16_length(ext + suffix)
-                    if room < 1:
+                    room_bytes = NAME_MAX_BYTES - len((ext + suffix).encode("utf-8", "surrogatepass"))
+                    if room < 1 or room_bytes < 4:
                         raise ValueError("无法为文件生成不重名的短名称：%s" % path)
-                    base = _utf16_prefix(stem, room).rstrip(" .") or "_"
+                    base = _utf16_prefix(stem, room, room_bytes).rstrip(" .") or "_"
                     new = base + suffix + ext
                     if new.casefold() not in used and new.casefold() not in reserved:
                         break

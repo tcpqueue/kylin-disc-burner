@@ -5,19 +5,21 @@ import datetime
 import getpass
 import html
 import os
+import posixpath
 import shutil
 import sys
 import tempfile
 import time
 
-from PyQt5.QtCore import (QMimeData, QObject, QProcess, QSettings, Qt, QThread, QTimer, QUrl,
-                          pyqtSignal, qVersion)
-from PyQt5.QtGui import QDrag, QFont, QFontDatabase, QIcon
+from PyQt5.QtCore import (QFileInfo, QMimeData, QObject, QProcess, QSettings, Qt, QThread, QTimer,
+                          QUrl, pyqtSignal, qVersion)
+from PyQt5.QtGui import QBrush, QColor, QDrag, QFont, QFontDatabase, QIcon, QPalette
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
-    QFormLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+    QFileIconProvider, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
+    QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator,
+    QVBoxLayout, QWidget)
 
 from . import __version__
 from . import backend as B
@@ -407,44 +409,77 @@ class RecoverDialog(QDialog):
         super(RecoverDialog, self).reject()
 
 
-class DropTree(QTreeWidget):
-    """支持从文件管理器拖入文件。"""
-
-    dropped = pyqtSignal(list)
-
-    def __init__(self, parent=None):
-        super(DropTree, self).__init__(parent)
-        self.setAcceptDrops(True)
-        self.setDragDropMode(QAbstractItemView.DropOnly)
-
-    def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
-            e.acceptProposedAction()
-        else:
-            super(DropTree, self).dragEnterEvent(e)
-
-    dragMoveEvent = dragEnterEvent
-
-    def dropEvent(self, e):
-        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
-        if paths:
-            self.dropped.emit(paths)
-            e.acceptProposedAction()
+ROLE_PATH = Qt.UserRole          # 盘上路径
+ROLE_KIND = Qt.UserRole + 1      # KIND_DISC / KIND_PENDING
+ROLE_PENDING = Qt.UserRole + 2   # 待刻录项目在 MainWindow.pending 里的编号
+ROLE_SORT = Qt.UserRole + 3      # 排序值：第 0 列是“是不是文件夹”，第 1、2 列是大小、时间
+ROLE_FOLDER = Qt.UserRole + 4    # 能不能往里放文件（光盘上的文件夹、新建的文件夹）
+KIND_DISC, KIND_PENDING = "disc", "pending"
+COLUMNS = ["名称", "大小", "修改时间", "说明"]
 
 
-class DiscTree(QTreeWidget):
-    """光盘现有内容。选中的文件可以拖到文件管理器或桌面，相当于复制出来。"""
+class FileItem(QTreeWidgetItem):
+    """文件夹排在文件前面；大小、时间按数值排。"""
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        col = tree.sortColumn() if tree is not None else 0
+        a, b = self.data(0, ROLE_SORT) or 0, other.data(0, ROLE_SORT) or 0
+        if a != b:
+            return a < b
+        if col in (1, 2):
+            x, y = self.data(col, ROLE_SORT) or 0, other.data(col, ROLE_SORT) or 0
+            if x != y:
+                return x < y
+        return self.text(col if col == 3 else 0).lower() < other.text(col if col == 3 else 0).lower()
+
+
+class FileTree(QTreeWidget):
+    """光盘上已有的文件和待刻录的文件放在同一个列表里。
+    光盘上的可以拖到文件管理器（相当于复制）；文件管理器里的可以拖进来，
+    拖到某个文件夹上就放进那个文件夹。"""
+
+    dropped = pyqtSignal(list, str)
+    delete_pressed = pyqtSignal()
 
     def __init__(self, provider, parent=None):
-        super(DiscTree, self).__init__(parent)
+        super(FileTree, self).__init__(parent)
         self.provider = provider   # 盘上路径列表 → 本机路径列表（或 None）
+        self.accept_files = True
         self.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.setDragEnabled(True)
-        self.setDragDropMode(QAbstractItemView.DragOnly)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setHeaderLabels(COLUMNS)
+        self.setSortingEnabled(True)
+        self.sortByColumn(0, Qt.AscendingOrder)
+        self.setAlternatingRowColors(True)
+        self.setUniformRowHeights(True)
+        h = self.header()
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in (1, 2, 3):
+            h.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        h.setStretchLastSection(False)
+
+    def _kind_items(self, kind):
+        return [it for it in self.selectedItems() if it.data(0, ROLE_KIND) == kind]
 
     def selected_paths(self):
-        return B.top_level([it.data(0, Qt.UserRole) for it in self.selectedItems()
-                            if it.data(0, Qt.UserRole)])
+        """选中的光盘上的项目（不含待刻录的）；文件夹里的不重复列。"""
+        return B.top_level([it.data(0, ROLE_PATH) for it in self._kind_items(KIND_DISC)])
+
+    def selected_pending(self):
+        return sorted(it.data(0, ROLE_PENDING) for it in self._kind_items(KIND_PENDING))
+
+    @staticmethod
+    def folder_for(item):
+        """新文件放到哪个光盘文件夹：选中文件夹就放进去，选中文件就放在它旁边。"""
+        if item is None:
+            return "/"
+        path = item.data(0, ROLE_PATH) or "/"
+        if item.data(0, ROLE_FOLDER):
+            return path
+        return posixpath.dirname(path) or "/"
 
     @staticmethod
     def mime_for(paths):
@@ -460,31 +495,156 @@ class DiscTree(QTreeWidget):
         drag.setMimeData(self.mime_for(paths))
         drag.exec_(Qt.CopyAction, Qt.CopyAction)
 
+    def _wants(self, e):
+        return e.source() is not self and self.accept_files and e.mimeData().hasUrls()
+
+    def dragEnterEvent(self, e):
+        if self._wants(e):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        if self._wants(e):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dropEvent(self, e):
+        if not self._wants(e):
+            return e.ignore()
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.dropped.emit(paths, self.folder_for(self.itemAt(e.pos())))
+            e.acceptProposedAction()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Delete:
+            self.delete_pressed.emit()
+            return
+        super(FileTree, self).keyPressEvent(e)
+
+
+DiscTree = FileTree     # 旧名字
+
+
+class Banner(QFrame):
+    """列表上方的提示条：说明这张盘的情况，旁边放可以直接点的按钮。"""
+
+    STYLES = {B.ERROR: ("#fdecea", "#d9534f"), B.WARN: ("#fff4e5", "#e69500"),
+              B.INFO: ("#e8f1fb", "#4a86c8"), B.OK: ("#e9f7ef", "#3c9d5d")}
+
+    def __init__(self, parent=None):
+        super(Banner, self).__init__(parent)
+        self.setObjectName("banner")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(10, 6, 6, 6)
+        self.label = QLabel()
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.PlainText)
+        h.addWidget(self.label, 1)
+        self.buttons = []
+        self._actions = []
+        for i in range(3):
+            b = QPushButton()
+            b.clicked.connect(lambda _c=False, i=i: self._actions[i][1]())
+            b.setVisible(False)
+            h.addWidget(b)
+            self.buttons.append(b)
+        self.level = ""
+        self.setVisible(False)
+
+    def show_message(self, level, text, actions=()):
+        bg, border = self.STYLES.get(level, self.STYLES[B.INFO])
+        self.setStyleSheet("QFrame#banner{background:%s;border:1px solid %s;border-radius:4px}"
+                           "QFrame#banner QLabel{color:#202020}" % (bg, border))
+        self.level = level
+        self.label.setText(text)
+        self._actions = list(actions)
+        for i, b in enumerate(self.buttons):
+            b.setVisible(i < len(self._actions))
+            if i < len(self._actions):
+                b.setText(self._actions[i][0])
+        self.setVisible(True)
+
+    def clear(self):
+        self.level = ""
+        self._actions = []
+        self.label.setText("")
+        self.setVisible(False)
+
+    def button(self, text):
+        for i, b in enumerate(self.buttons):
+            if b.isVisible() and b.text() == text:
+                return b
+        return None
+
+
+class Pending(object):
+    """一项待刻录的内容。src 为 None 的是在光盘上新建的空文件夹。"""
+
+    def __init__(self, src, folder="/", name=None, size=0, count=0, transfer=False):
+        self.src = src
+        self.folder = folder
+        self.name = name or os.path.basename(src.rstrip("\\/")) or src
+        self.size = size
+        self.count = count
+        self.transfer = transfer   # “转存到新光盘”时从原盘读出来的
+        try:
+            self.mtime = os.path.getmtime(src) if src else None
+        except OSError:
+            self.mtime = None
+
+    @property
+    def dst(self):
+        return B.disc_join(self.folder, self.name)
+
+    @property
+    def bytes(self):
+        """实际大小（显示用；size 是按扇区取整的，用来算容量）。"""
+        if not hasattr(self, "_bytes"):
+            self._bytes = B.local_bytes(self.src) if self.src else 0
+        return self._bytes
+
+    @property
+    def is_dir(self):
+        return self.src is None or os.path.isdir(self.src)
+
+
+HINT_DUP = "与其他待刻录的重名"
+HINT_REPLACE = "替换光盘上的同名文件"
+HINT_MERGE = "并入光盘上的同名文件夹"
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super(MainWindow, self).__init__()
         self.setWindowTitle("%s %s" % (APP_NAME, __version__))
         self.setWindowIcon(app_icon())
-        self.resize(1000, 700)
+        self.resize(1060, 720)
 
         self.media = B.MediaInfo()
         self.disc_entries = []
+        self.pending = []            # type: list  # Pending
         self.drives = []
         self.burning = False
         self._remount = ""   # 写入前被卸载、写完要挂回去的设备
         self._copied = []    # “复制到…”的目标路径，复制完核对用
-        self._tree_sbsector = None   # 左边列的不是最后一个会话时，那个 ISO 会话的起始扇区
-        self._stage = None           # 往 UDF 盘追加时读出 UDF 文件的临时目录
-        self._pending_burn = None
-        self._hidden = []            # “从光盘删除”的项目，写完核对用
+        self._tree_sbsector = None   # 列的不是最后一个会话时，那个 ISO 会话的起始扇区
+        self._udf_root = None        # 盘上 UDF 部分在本机的挂载目录
+        self._udf_entries = []
+        self._udf_newer = True       # 混合盘上 UDF 部分是不是后写的（同名时以后写的为准）
         self._udf_paths, self._iso_paths = set(), set()   # 混合盘上各项来自哪一部分
+        self._transfer = None        # 正在“转存到新光盘”：dict(stage, files, size, volid)
+        self._hidden = []            # “从光盘删除”的项目，写完核对用
+        self._renames = []
+        self._after_read = None      # 读完盘接着要做的事
         self._fs_prompted = ""       # 已经问过要不要读出全部文件的设备
-        self._after_read_all = False  # 刚挂上 UDF 部分，刷新完接着问要不要修复
-        self._converting = False     # 正在“修复光盘文件系统”（没有新文件的追加）
         self._outdev_retry = False
         # 已经提示过修复的设备，避免每次刷新都弹窗；换盘/弹出后清空
         self._repair_prompted = ""
+        self._present = None         # 上次查到的光驱里有没有盘，用来发现放入/取出
+        self._stale = set()          # 刻完没弹出的光驱：系统挂载看到的是旧内容（见 _release_drive）
         self.job = Job(self)
         self.job.line.connect(self._log)
         self.job.progress.connect(self._on_progress)
@@ -498,10 +658,15 @@ class MainWindow(QMainWindow):
         self._stall_timer = QTimer(self)
         self._stall_timer.setInterval(5000)
         self._stall_timer.timeout.connect(self._check_stall)
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(2500)
+        self._poll_timer.timeout.connect(self._poll_media)
 
         self._build_ui()
         self._set_busy(False)
+        self._clean_old_stage()
         self.refresh_drives()
+        self._poll_timer.start()
 
     # ------------------------------------------------------------ 界面
 
@@ -513,30 +678,32 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("刻录机："))
         self.cb_drive = QComboBox()
-        self.cb_drive.setMinimumWidth(380)
+        self.cb_drive.setMinimumWidth(360)
         self.cb_drive.activated.connect(self._drive_chosen)
         row.addWidget(self.cb_drive, 1)
         self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setToolTip("重新查找刻录机、读取光盘。放入或取出光盘时会自动刷新")
         self.btn_refresh.clicked.connect(self.refresh_drives)
         self.btn_eject = QPushButton("弹出")
         self.btn_eject.clicked.connect(self.eject)
-        self.btn_blank = QPushButton("擦除可擦写盘…")
-        self.btn_blank.clicked.connect(self.blank)
-        self.btn_repair = QPushButton("修复未关闭会话…")
-        self.btn_repair.setStyleSheet("color:#c0392b;font-weight:bold")
-        self.btn_repair.clicked.connect(lambda: self.repair(ask=True))
-        self.btn_repair.setVisible(False)
-        self.btn_fsfix = QPushButton("复制全部到本机…")
-        self.btn_fsfix.setStyleSheet("color:#d35400;font-weight:bold")
-        self.btn_fsfix.setToolTip("复制当前可读的全部文件；再换空白光盘刻录成 ISO9660，原盘不改写")
-        self.btn_fsfix.clicked.connect(lambda: self.convert_to_iso(ask=True))
-        self.btn_fsfix.setVisible(False)
-        self.btn_diag = QPushButton("光盘诊断…")
-        self.btn_diag.setToolTip("查看光盘类型、开闭状态、会话/轨道、文件系统，挂载读取 UDF 等光盘")
-        self.btn_diag.clicked.connect(self.diagnose)
-        for b in (self.btn_repair, self.btn_fsfix, self.btn_diag, self.btn_refresh, self.btn_eject,
-                  self.btn_blank):
-            row.addWidget(b)
+        self.btn_tools = QToolButton()
+        self.btn_tools.setText("更多功能")
+        self.btn_tools.setPopupMode(QToolButton.InstantPopup)
+        self.btn_tools.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        menu = QMenu(self.btn_tools)
+        self.act_copy_all = menu.addAction("把整张光盘复制到电脑…", lambda: self.copy_all())
+        self.act_transfer = menu.addAction("转存到新光盘…", lambda: self.transfer_to_new_disc())
+        menu.addSeparator()
+        self.act_diag = menu.addAction("光盘诊断…", lambda: self.diagnose())
+        self.act_names = menu.addAction("恢复长文件名…", lambda: self.recover_names(self.current_dev()))
+        self.act_repair = menu.addAction("修复未关闭会话…", lambda: self.repair(ask=True))
+        self.act_blank = menu.addAction("擦除可擦写盘…", lambda: self.blank())
+        menu.addSeparator()
+        menu.addAction("生成 / 追加 ISO 镜像文件…", lambda: self._choose_image())
+        menu.aboutToShow.connect(self._update_tools)
+        self.btn_tools.setMenu(menu)
+        for w in (self.btn_refresh, self.btn_eject, self.btn_tools):
+            row.addWidget(w)
         v.addLayout(row)
 
         self.lb_media = QLabel("正在检测刻录机……")
@@ -545,66 +712,48 @@ class MainWindow(QMainWindow):
         self.bar_capacity = QProgressBar()
         self.bar_capacity.setTextVisible(True)
         v.addWidget(self.bar_capacity)
+        self.banner = Banner()
+        v.addWidget(self.banner)
 
-        # 左：光盘现有内容；右：待刻录
-        split = QSplitter(Qt.Horizontal)
-        g_disc = QGroupBox("光盘现有内容（可拖出复制）")
-        lv = QVBoxLayout(g_disc)
-        self.tree_disc = DiscTree(self._drag_paths)
-        self.tree_disc.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.tree_disc.customContextMenuRequested.connect(self._disc_menu)
-        self.tree_disc.setHeaderLabels(["名称", "大小"])
-        self.tree_disc.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree_disc.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.tree_disc.header().setStretchLastSection(False)
-        lv.addWidget(self.tree_disc)
-        split.addWidget(g_disc)
+        # 光盘内容 + 待刻录，同一个列表
+        self.tree = FileTree(self._drag_paths)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._tree_menu)
+        self.tree.dropped.connect(self.add_paths)
+        self.tree.delete_pressed.connect(self._remove_selected)
+        self.tree.itemSelectionChanged.connect(self._selection_changed)
+        self.tree_disc = self.tree   # 旧名字
+        v.addWidget(self.tree, 1)
 
-        g_new = QGroupBox("待刻录（可直接把文件拖进来）")
-        rv = QVBoxLayout(g_new)
-        trow = QHBoxLayout()
-        trow.addWidget(QLabel("放到光盘目录："))
-        self.ed_target = QLineEdit("/")
-        self.ed_target.textChanged.connect(self._update_pending)
-        trow.addWidget(self.ed_target, 1)
-        b_date = QPushButton("按日期建文件夹")
-        b_date.clicked.connect(lambda: self.ed_target.setText(
-            "/" + datetime.date.today().strftime("%Y-%m-%d")))
-        b_root = QPushButton("根目录")
-        b_root.clicked.connect(lambda: self.ed_target.setText("/"))
-        trow.addWidget(b_date)
-        trow.addWidget(b_root)
-        rv.addLayout(trow)
-        self.tree_new = DropTree()
-        self.tree_new.setHeaderLabels(["名称", "大小", "光盘位置", "提示"])
-        self.tree_new.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.tree_new.header().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.tree_new.dropped.connect(self.add_paths)
-        rv.addWidget(self.tree_new)
         brow = QHBoxLayout()
         self.btn_add_files = QPushButton("添加文件…")
         self.btn_add_files.clicked.connect(self._pick_files)
         self.btn_add_dir = QPushButton("添加文件夹…")
         self.btn_add_dir.clicked.connect(self._pick_dir)
-        self.btn_remove = QPushButton("移除所选")
+        self.btn_new_dir = QPushButton("新建文件夹…")
+        self.btn_new_dir.setToolTip("在光盘上新建一个文件夹（默认用今天的日期命名），再往里添加文件")
+        self.btn_new_dir.clicked.connect(lambda: self.new_folder())
+        self.btn_remove = QPushButton("不刻录所选")
+        self.btn_remove.setToolTip("从待刻录里去掉选中的项目（光盘上已有的不受影响）")
         self.btn_remove.clicked.connect(self._remove_selected)
-        self.btn_clear = QPushButton("清空")
-        self.btn_clear.clicked.connect(self._clear_pending)
-        for b in (self.btn_add_files, self.btn_add_dir, self.btn_remove, self.btn_clear):
+        for b in (self.btn_add_files, self.btn_add_dir, self.btn_new_dir, self.btn_remove):
             brow.addWidget(b)
-        brow.addStretch(1)
-        rv.addLayout(brow)
-        split.addWidget(g_new)
-        split.setSizes([420, 580])
-        v.addWidget(split, 1)
+        self.lb_target = QLabel()
+        self.lb_target.setTextFormat(Qt.PlainText)
+        brow.addSpacing(12)
+        brow.addWidget(self.lb_target, 1)
+        self.lb_legend = QLabel("颜色浅的是待刻录的；可以把文件直接拖进来，拖到文件夹上就放进那个文件夹")
+        self.lb_legend.setStyleSheet("color:gray")
+        v.addLayout(brow)
+        v.addWidget(self.lb_legend)
 
         # 选项
         g_opt = QGroupBox("刻录选项")
         oh = QHBoxLayout(g_opt)
         form = QFormLayout()
         self.ed_volid = QLineEdit()
-        self.ed_volid.setPlaceholderText("光盘名称，Windows 中显示")
-        form.addRow("卷标：", self.ed_volid)
+        self.ed_volid.setPlaceholderText("Windows“此电脑”里显示的光盘名称")
+        form.addRow("光盘名称：", self.ed_volid)
         self.cb_speed = QComboBox()
         self.cb_speed.addItem("自动", "")
         self.cb_speed.addItem("最低速（最稳妥，适合归档）", "min")
@@ -655,25 +804,37 @@ class MainWindow(QMainWindow):
         v.addWidget(self.log, 1)
 
         self.setCentralWidget(root)
+        self._selection_changed()
 
     def _set_busy(self, busy, burning=False):
         self.burning = burning
-        for w in (self.cb_drive, self.btn_refresh, self.btn_eject, self.btn_burn, self.btn_diag,
-                  self.btn_add_files, self.btn_add_dir, self.btn_remove,
-                  self.btn_clear, self.ed_volid, self.ed_target, self.cb_speed,
-                  self.chk_open, self.chk_verify, self.chk_eject):
+        for w in (self.cb_drive, self.btn_refresh, self.btn_eject, self.btn_burn, self.btn_tools,
+                  self.btn_add_files, self.btn_add_dir, self.btn_new_dir, self.btn_remove,
+                  self.ed_volid, self.cb_speed, self.chk_open, self.chk_verify, self.chk_eject):
             w.setEnabled(not busy)
-        self.btn_blank.setEnabled(not busy and self.media.present and self.media.rewritable)
-        self.btn_repair.setVisible(self.media.needs_repair)
-        self.btn_repair.setEnabled(not busy)
-        self.btn_fsfix.setVisible(self._can_fix_fs())
-        self.btn_fsfix.setEnabled(not busy)
-        self.tree_new.setAcceptDrops(not busy)
+        for b in self.banner.buttons:
+            b.setEnabled(not busy)
+        self.tree.accept_files = not busy
         if busy:
             QApplication.setOverrideCursor(Qt.BusyCursor)
         else:
             while QApplication.overrideCursor():
                 QApplication.restoreOverrideCursor()
+
+    def _busy(self):
+        copying = getattr(self, "_copy_thread", None)
+        return self.job.running() or bool(copying and copying.isRunning())
+
+    def _update_tools(self):
+        m, dev = self.media, self.current_dev()
+        drive = B.is_drive(dev)
+        has_files = bool(self.disc_entries)
+        self.act_copy_all.setEnabled(has_files)
+        self.act_transfer.setEnabled(drive and has_files and self._transfer is None)
+        self.act_diag.setEnabled(bool(dev) and dev != IMAGE_ITEM)
+        self.act_names.setEnabled(bool(dev) and m.has_iso and m.appendable and not m.udf_history)
+        self.act_repair.setEnabled(drive and m.needs_repair)
+        self.act_blank.setEnabled(drive and m.present and m.rewritable)
 
     def _log(self, text):
         self.log.appendPlainText(text)
@@ -749,10 +910,31 @@ class MainWindow(QMainWindow):
         return self.cb_drive.currentData() or ""
 
     def _release_drive(self, dev, remount=True):
-        """写入前把光盘从系统卸下（挂载着不能独占光驱）。原来挂载着的，写完再挂回去，
-        文件管理器里照常能看到；写完要弹出的就不用了。"""
-        self._remount = dev if remount and not B.IS_WINDOWS and B.is_mounted(dev) else ""
+        """写入前把光盘从系统卸下（挂载着不能独占光驱）。
+
+        麒麟上写完不弹出时不再挂回去：内核还记着刻录前的会话位置，要等换盘（弹出再放入）
+        才重新读，这时挂上看到的是旧内容。本软件自己用 xorriso 读，不受影响；
+        复制、拖出也不走系统挂载目录，直到光盘被取出。"""
+        self._remount = ""
+        if remount and not B.IS_WINDOWS and B.is_drive(dev):
+            self._stale.add(dev)
         B.unmount(dev)
+
+    def _poll_media(self):
+        """放入、取出、换了光盘时自动重新读，不用点“刷新”。"""
+        dev = self.current_dev()
+        if not B.is_drive(dev) or self._busy() or not self.isVisible():
+            return
+        present = B.media_present_quick(dev)
+        if present is None:
+            return
+        last, self._present = self._present, present
+        if last is None or present == last:
+            return
+        if present:
+            self.refresh_media()
+        else:
+            self._ejected()
 
     # ------------------------------------------------------------ 刻录机 / 盘片
 
@@ -765,8 +947,8 @@ class MainWindow(QMainWindow):
             for i in range(self.cb_drive.count())
             if self.cb_drive.itemData(i) and self.cb_drive.itemData(i) != IMAGE_ITEM
             and not B.is_drive(self.cb_drive.itemData(i))]
-        self.lb_media.setText("正在扫描刻录机……")
-        self._run(["-devices"], self._drives_done, "正在扫描刻录机……")
+        self.lb_media.setText("正在查找刻录机……")
+        self._run(["-devices"], self._drives_done, "正在查找刻录机……")
 
     def _drives_done(self, code, out):
         self.drives = B.sort_drives(B.parse_devices(out))
@@ -790,9 +972,9 @@ class MainWindow(QMainWindow):
             self.refresh_media()
             return
         self.media = B.MediaInfo()
-        self.disc_entries = []
-        self.tree_disc.clear()
+        self._set_entries([], [])
         self._show_media()
+        self._fill_tree()
         if B.IS_WINDOWS:
             text = "<b>未找到刻录机。</b>请检查光驱连接和供电，然后点“刷新”。"
             if unknown:
@@ -803,6 +985,12 @@ class MainWindow(QMainWindow):
             self.lb_media.setText(
                 "<b>未找到刻录机。</b>请检查光驱连接；若已连接，确认当前用户有权限访问 "
                 "/dev/sr0（<code>sudo usermod -aG cdrom $USER</code> 后重新登录）。")
+
+    def _choose_image(self):
+        idx = self.cb_drive.findData(IMAGE_ITEM)
+        if idx >= 0:
+            self.cb_drive.setCurrentIndex(idx)
+            self._drive_chosen(idx)
 
     def _drive_chosen(self, _index):
         if self.cb_drive.currentData() == IMAGE_ITEM:
@@ -822,23 +1010,25 @@ class MainWindow(QMainWindow):
                                          B.Drive(path).label, path)
                 idx = self.cb_drive.findData(path)
             self.cb_drive.setCurrentIndex(idx)
+        self._present = None
         self.refresh_media()
 
     def refresh_media(self):
         dev = self.current_dev()
-        if not dev or dev == IMAGE_ITEM:
+        if not dev or dev == IMAGE_ITEM or self.job.running():
             return
         if B.is_drive(dev):
             QSettings("discburner", "discburner").setValue("drive", dev)
+            self._present = B.media_present_quick(dev)
         self.media = B.MediaInfo()
-        self.disc_entries = []
-        self.tree_disc.clear()
+        self._set_entries([], [])
         if not B.is_drive(dev) and not os.path.exists(dev):
             # 新镜像文件：当作空白盘
             self.media.present = self.media.blank = True
-            self._show_media()
+            self._media_shown()
             return
-        self.lb_media.setText("正在读取光盘信息……")
+        self.lb_media.setText("正在读取光盘……")
+        self._fill_tree()
         self._outdev_retry = False
         args = B.toc_args(dev) + ["-find", "/", "-exec", "lsdl", "--"]
         self._run(args, self._media_done, "正在读取光盘……")
@@ -850,61 +1040,95 @@ class MainWindow(QMainWindow):
             self._outdev_retry = True
             self._run(B.outdev_toc_args(dev), self._media_done, "正在读取光驱状态……")
             return
-        self.media = B.parse_toc(out)
-        self.media.udf_history = B.has_udf_history(dev, self.media)
-        self.media.udf_bridge = B.is_current_udf_bridge(dev, self.media)
+        self.media = m = B.parse_toc(out)
+        m.udf_history = B.has_udf_history(dev, m)
+        m.udf_bridge = B.is_current_udf_bridge(dev, m)
         if self._outdev_retry:
-            self.media.tree_unreadable = True
-        self.disc_entries = B.parse_lsdl(out) if self.media.has_iso else []
+            m.tree_unreadable = True
+        iso = B.parse_lsdl(out) if m.has_iso else []
         self._tree_sbsector = None
-        self._udf_paths, self._iso_paths = set(), set()
-        if self.media.foreign_data:
-            # 最后一个会话不是 ISO，xorriso 读到的是空目录。UDF 部分挂着就列挂载目录；
-            # 前面还有 ISO 会话的，再用 xorriso 列出那个会话，两部分合在一起显示
-            udf = self._udf_source(dev)
-            self.disc_entries = B.walk_mount(udf) if udf else []
-            self._udf_paths = {e.path for e in self.disc_entries}
-            if self.media.iso_hidden:
-                self._tree_sbsector = self.media.last_iso_start
-                self._run(B.list_files_args(dev, self._tree_sbsector), self._iso_part_listed,
-                          "正在读取光盘的 ISO 部分……")
+        self._udf_root = None
+        udf = []
+        if m.foreign_data or m.split:
+            # 盘上有 UDF：系统挂着的 UDF 部分（Windows 上就是盘符）也列出来，和 ISO 部分合在一起
+            self._udf_root = self._udf_source(dev)
+            udf = B.walk_mount(self._udf_root) if self._udf_root else []
+        if m.udf_bridge and udf:
+            iso = []    # 同一个会话里的两套目录，内容一样；UDF 里的名字不会被截短
+        if not m.has_iso and m.volume_id == "ISOIMAGE":
+            m.volume_id = ""    # xorriso 在没有 ISO 目录时给的默认名字，不是盘的名字
+        if not m.volume_id and self._udf_root:     # UDF 盘的名字：问系统
+            if B.IS_WINDOWS:
+                from . import winsys
+                info = winsys.volume_info(B.drive_letter(dev))
+                m.volume_id = info[0] if info else ""
+            else:
+                m.volume_id = B.probe_blkid(dev)[0].get("label", "")
+        self._set_entries(iso, udf, udf_newer=not m.split)
+        if m.iso_hidden:
+            # 最后一个会话不是 ISO，xorriso 读到的是空目录，再单独列出前面那个 ISO 会话
+            self._tree_sbsector = m.last_iso_start
+            self._run(B.list_files_args(dev, self._tree_sbsector), self._iso_part_listed,
+                      "正在读取光盘的 ISO 部分……")
+            return
         self._media_shown()
 
-    def _iso_part_listed(self, code, out):
-        iso = B.parse_lsdl(out)
+    def _exact_times(self, iso):
+        """xorriso 对半年以前的文件只列出日期。光盘被系统挂着（ISO）时，从挂载目录补上时分。"""
+        dev = self.current_dev()
+        rough = [e for e in iso if not e.mtime_exact]
+        if not rough or not B.is_drive(dev) or dev in self._stale:
+            return
+        m = B.mount_info(dev)
+        if not m or m[1].lower() == "udf":
+            return
+        for e in rough:
+            try:
+                e.mtime = os.stat(os.path.join(m[0], *e.path.strip("/").split("/"))).st_mtime
+                e.mtime_exact = True
+            except OSError:
+                pass
+
+    def _set_entries(self, iso, udf, udf_newer=True):
+        self._exact_times(iso)
+        for e in iso:
+            e.part = B.PART_ISO
         self._iso_paths = {e.path for e in iso}
-        self.disc_entries = B.merge_entries(iso, self.disc_entries)
+        self._udf_entries = list(udf)
+        self._udf_paths = {e.path for e in udf}
+        self._udf_newer = udf_newer
+        self.disc_entries = B.merge_entries(iso, udf, udf_newer) if udf else list(iso)
+
+    def _iso_part_listed(self, code, out):
+        self._set_entries(B.parse_lsdl(out), self._udf_entries, True)
         self._media_shown()
 
     def _media_shown(self):
         if self.job.running():
             return
         self.lb_stage.setText("就绪")
-        self._fill_disc_tree()
-        self._show_media()
-        if self.media.has_iso and self.media.volume_id and not self.ed_volid.text():
-            self.ed_volid.setText(self.media.volume_id)
-        elif self.media.blank and not self.ed_volid.text():
+        m = self.media
+        if m.has_iso and m.volume_id and not self.ed_volid.text():
+            self.ed_volid.setText(m.volume_id)
+        elif m.blank and not self.ed_volid.text():
             self.ed_volid.setText("光盘" + datetime.date.today().strftime("%Y-%m-%d"))
-        self._update_pending()
+        self._show_media()
+        self._fill_tree()
         self._set_busy(False)
-        after_copy_read = getattr(self, "_copy_after_media", None)
-        if after_copy_read:
-            self._copy_after_media = None
-            QTimer.singleShot(0, after_copy_read)
-        if not self.media.present:
+        dev = self.current_dev()
+        after, self._after_read = self._after_read, None
+        if after:
+            QTimer.singleShot(0, after)
+            return
+        if not m.present:
             self._repair_prompted = ""
             self._fs_prompted = ""
-        elif self.media.foreign_data and not self.media.needs_repair:
-            # 混合格式 / UDF 盘：不等用户去点“光盘诊断”，自动问要不要读出全部文件、修复
-            if self._after_read_all:
-                self._after_read_all = False
-                QTimer.singleShot(0, self._offer_fs_fix)
-            elif self._fs_prompted != self.current_dev():
-                self._fs_prompted = self.current_dev()
-                QTimer.singleShot(0, self._offer_read_all)
-        elif self.media.needs_repair and self._repair_prompted != self.current_dev():
-            self._repair_prompted = self.current_dev()
+        elif self._udf_unread() and self._fs_prompted != dev:
+            # 混合格式 / UDF 盘：不等用户去点“光盘诊断”，自动问要不要读出全部文件
+            self._fs_prompted = dev
+            QTimer.singleShot(0, self._offer_read_all)
+        elif m.needs_repair and self._repair_prompted != dev:
+            self._repair_prompted = dev
             if QMessageBox.question(
                     self, "发现未关闭的会话",
                     "这张光盘有一个会话没有关闭。\n\n"
@@ -921,50 +1145,217 @@ class MainWindow(QMainWindow):
         m = self.media
         is_image = not B.is_drive(self.current_dev())
         if not m.present:
-            self.lb_media.setText("<b>未检测到光盘</b>，请放入光盘后点“刷新”。")
+            self.lb_media.setText("<b>光驱里没有光盘</b>，放入光盘后会自动读取。")
         else:
             color = {"空白盘": "green", "可追加": "green"}.get(m.status_text(), "red")
-            if m.foreign_data and m.appendable:
-                color = "#d35400"
-            if m.needs_repair:
+            if m.needs_repair or m.udf_history or m.foreign_data:
                 color = "#d35400"
             parts = ["类型：<b>%s</b>" % ("ISO 镜像文件" if is_image else html.escape(m.profile)),
-                     "状态：<b style='color:%s'>%s</b>" % (color, html.escape(m.status_text()))]
+                     "状态：<b style='color:%s'>%s</b>" % (color, html.escape(self._status_text()))]
             if m.sessions:
-                parts.append("已有 %d 次刻录记录" % m.sessions)
+                parts.append("已刻录过 %d 次" % m.sessions)
             if m.volume_id:
-                parts.append("卷标：%s" % html.escape(m.volume_id))
+                parts.append("光盘名称：%s" % html.escape(m.volume_id))
             if not is_image:
                 parts.append("已用 %s / 剩余 %s" % (B.human_size(m.used_bytes),
                                                  B.human_size(m.free_bytes)))
-            text = "　".join(parts)
-            if m.needs_repair:
-                text += ("<br><b style='color:#d35400'>此盘有未关闭的会话，所以读不出内容。"
-                         "点右上角“修复未关闭会话”即可关闭它，已有数据不受影响。</b>")
-            elif m.udf_history or m.foreign_data:
-                text += ("<br><b style='color:#d35400'>这张盘包含 UDF，Windows 可能显示旧 UDF 目录。"
-                         "原盘追加已停用；可先用“光盘诊断”读取，复制到本机后再换空白光盘刻录。</b>")
-            elif m.tree_unreadable:
-                text += ("<br><b style='color:red'>光驱能看到这张盘，但读不出盘上的目录，"
-                         "可能是刻录失败或盘片损坏。点“光盘诊断”查看详情。</b>")
-            elif m.closed:
-                text += "<br><b style='color:red'>此盘已封盘，无法再写入，只能读取。</b>"
-            self.lb_media.setText(text)
+            self.lb_media.setText("　".join(parts))
+        self._update_banner()
         self._update_capacity()
 
-    def _fill_disc_tree(self):
-        self.tree_disc.clear()
-        nodes = {"/": self.tree_disc.invisibleRootItem()}
+    def _status_text(self):
+        m = self.media
+        if m.present and m.appendable and (m.udf_history or m.foreign_data) and not m.needs_repair:
+            return "只能读取（含 UDF 格式，不能追加）"
+        return m.status_text()
+
+    def _udf_unread(self):
+        """盘上还有 UDF 部分没读出来（麒麟上要以管理员身份单独挂载）。"""
+        m, dev = self.media, self.current_dev()
+        return (not B.IS_WINDOWS and B.is_drive(dev) and m.present and not m.needs_repair
+                and (m.foreign_data or m.split) and not m.udf_bridge and self._udf_root is None
+                and self._udf_start(dev) is not None)
+
+    def _update_banner(self):
+        m, dev, ban = self.media, self.current_dev(), self.banner
+        t = self._transfer
+        transfer_tail = ""
+        if t:
+            transfer_tail = ("转存：原盘的 %d 个文件（%s）已读到电脑上。"
+                             % (t["files"], B.human_size(t["size"])))
+        if t and not m.present:
+            return ban.show_message(B.INFO, transfer_tail + "请放入一张空白光盘，读出后点“开始刻录”。",
+                                    [("取消转存", self.cancel_transfer)])
+        if not m.present:
+            return ban.clear()
+        if m.needs_repair:
+            return ban.show_message(
+                B.ERROR, "这张盘有一个会话没有关闭（通常是 Windows“类似 USB 闪存驱动器”方式刻录后"
+                         "没有正常弹出），所以读不出内容。修复只关闭这个会话，不会删除数据。",
+                [("修复", lambda: self.repair(ask=True)), ("光盘诊断…", self.diagnose)])
+        if t and (m.udf_history or m.foreign_data):
+            return ban.show_message(B.WARN, transfer_tail + "这还是含 UDF 的那张盘，请换一张空白光盘。",
+                                    [("弹出", self.eject), ("取消转存", self.cancel_transfer)])
+        if t and m.can_write:
+            return ban.show_message(B.INFO, transfer_tail + "点“开始刻录”刻到这张盘上，"
+                                    "刻完后 Windows 和麒麟都能读，也能继续追加。",
+                                    [("取消转存", self.cancel_transfer)])
+        copy_actions = [("转存到新光盘…", self.transfer_to_new_disc),
+                        ("复制到电脑…", self.copy_all)]
+        if self._udf_unread():
+            return ban.show_message(
+                B.WARN, "这张盘上有一部分文件是 Windows 用 UDF 格式写的，系统默认读不到，"
+                        "列表里还缺这部分。点“读出全部文件”（要输入管理员密码）。",
+                [("读出全部文件", self._offer_read_all)])
+        if m.split:
+            system = "Windows 资源管理器" if B.IS_WINDOWS else "麒麟文件管理器"
+            return ban.show_message(
+                B.WARN, "这张盘先用 UDF 格式刻过（一般是 Windows 刻的），后来又追加过：Windows 只显示"
+                        "早先的文件，麒麟只显示后来的文件。列表里两部分都有，“说明”一栏标出了%s"
+                        "里看不到的。这张盘不能再追加，建议转存到新光盘。" % system, copy_actions)
+        if m.iso_hidden:
+            return ban.show_message(
+                B.WARN, "这张盘先用 ISO9660 格式刻过，后来又被 Windows 用“类似 USB 闪存驱动器”方式"
+                        "（UDF 格式）接着写过：Windows 只显示后写的 UDF 文件，麒麟默认只能读到前面的部分。"
+                        "列表里两部分都有。这张盘不能再追加，建议转存到新光盘。", copy_actions)
+        if m.foreign_data and not m.udf_bridge:
+            return ban.show_message(
+                B.WARN, "这是 Windows 用“类似 USB 闪存驱动器”方式（UDF 格式）刻的盘，"
+                        "两边都能读，但本软件不能往里追加：追加的内容 Windows 上看不到。"
+                        "要加文件，请转存到新光盘。", copy_actions)
+        if m.udf_bridge:
+            return ban.show_message(
+                B.INFO, "这是 Windows 自带刻录刻的盘，Windows 和麒麟都能读。本软件不能往里追加"
+                        "（追加的内容 Windows 上看不到），要加文件请转存到新光盘。", copy_actions)
+        if m.tree_unreadable:
+            return ban.show_message(B.ERROR, "光驱能看到这张盘，但读不出盘上的目录，"
+                                             "可能是刻录失败或盘片损坏。",
+                                    [("光盘诊断…", self.diagnose)])
+        shorts = [e for e in self.disc_entries
+                  if not e.is_dir and B.is_short_name(posixpath.basename(e.path))]
+        if shorts and m.sessions >= 2 and m.appendable and not m.udf_history:
+            return ban.show_message(
+                B.WARN, "有 %d 个文件只剩短文件名（如 %s），一般是 Windows 往麒麟刻的盘上追加造成的。"
+                        "早先刻录的记录里可能还留着原名。" % (len(shorts), posixpath.basename(shorts[0].path)),
+                [("恢复长文件名…", lambda: self.recover_names(self.current_dev()))])
+        if m.closed:
+            return ban.show_message(B.INFO, "这张盘已封盘，只能读取，不能再写入。",
+                                    [("转存到新光盘…", self.transfer_to_new_disc)]
+                                    if B.is_drive(dev) and self.disc_entries else [])
+        ban.clear()
+
+    # ------------------------------------------------------------ 文件列表
+
+    def _icon(self, path, is_dir, local=None):
+        if is_dir:
+            return self._icons.icon(QFileIconProvider.Folder)
+        if local:
+            return self._icons.icon(QFileInfo(local))
+        return self._icons.icon(QFileIconProvider.File)
+
+    def _part_note(self, e):
+        """混合盘上，标出系统文件管理器里看不到的那部分。"""
+        m = self.media
+        if not (self._udf_paths and self._iso_paths) or e.is_dir and \
+                e.path in self._udf_paths and e.path in self._iso_paths:
+            return ""
+        if m.split:
+            if B.IS_WINDOWS:
+                return "资源管理器里看不到" if e.path not in self._udf_paths else ""
+            return "文件管理器里看不到" if e.path not in self._iso_paths else ""
+        if m.iso_hidden:
+            return "系统默认看不到" if e.path not in self._udf_paths else ""
+        return ""
+
+    def _fill_tree(self):
+        t = self.tree
+        if not hasattr(self, "_icons"):
+            self._icons = QFileIconProvider()
+        expanded = set()
+        it = QTreeWidgetItemIterator(t)
+        while it.value():
+            if it.value().isExpanded():
+                expanded.add(it.value().data(0, ROLE_PATH))
+            it += 1
+        selected = {(i.data(0, ROLE_KIND), i.data(0, ROLE_PATH)) for i in t.selectedItems()}
+        scroll = t.verticalScrollBar().value()
+        t.setSortingEnabled(False)
+        t.clear()
+        nodes = {"/": t.invisibleRootItem()}
+        hints = self._pending_hints()
+        replaced = {self.pending[i].dst for i, h in hints.items() if h == HINT_REPLACE}
+        first_level = not expanded
         for e in sorted(self.disc_entries, key=lambda x: x.path):
-            parent_path = os.path.dirname(e.path) or "/"
-            parent = nodes.get(parent_path, self.tree_disc.invisibleRootItem())
-            item = QTreeWidgetItem(parent, [os.path.basename(e.path),
-                                            "" if e.is_dir else B.human_size(e.size)])
-            item.setIcon(0, QIcon.fromTheme("folder" if e.is_dir else "text-x-generic"))
-            item.setData(0, Qt.UserRole, e.path)
+            parent = nodes.get(posixpath.dirname(e.path) or "/", t.invisibleRootItem())
+            item = FileItem(parent, [posixpath.basename(e.path),
+                                     "" if e.is_dir else B.human_size(e.size),
+                                     B.format_mtime(e.mtime, e.mtime_exact),
+                                     "将被新文件替换" if e.path in replaced else self._part_note(e)])
+            item.setIcon(0, self._icon(e.path, e.is_dir))
+            item.setData(0, ROLE_PATH, e.path)
+            item.setData(0, ROLE_KIND, KIND_DISC)
+            item.setData(0, ROLE_SORT, 0 if e.is_dir else 1)
+            item.setData(0, ROLE_FOLDER, e.is_dir)
+            item.setData(1, ROLE_SORT, e.size)
+            item.setData(2, ROLE_SORT, e.mtime or 0)
+            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            if item.text(3):
+                item.setForeground(3, QBrush(QColor("#d35400")))
             if e.is_dir:
                 nodes[e.path] = item
-        self.tree_disc.expandToDepth(0)
+        faded = self.palette().color(QPalette.Text)
+        faded.setAlpha(110)
+        pending_brush, note_brush = QBrush(faded), QBrush(QColor("#2f6fb5"))
+        order = sorted(range(len(self.pending)), key=lambda i: self.pending[i].dst.count("/"))
+        for i in order:
+            p = self.pending[i]
+            parent = nodes.get(p.folder, t.invisibleRootItem())
+            note = hints.get(i) or ("新建文件夹" if p.src is None else
+                                    "转存" if p.transfer else "待刻录")
+            if p.count > 1:
+                note += "（%d 个文件）" % p.count
+            item = FileItem(parent, [p.name, "" if p.src is None else B.human_size(p.bytes),
+                                     B.format_mtime(p.mtime), note])
+            item.setIcon(0, QIcon(self._icon(p.dst, p.is_dir, p.src).pixmap(16, QIcon.Disabled)))
+            item.setData(0, ROLE_PATH, p.dst)
+            item.setData(0, ROLE_KIND, KIND_PENDING)
+            item.setData(0, ROLE_PENDING, i)
+            item.setData(0, ROLE_SORT, 0 if p.is_dir else 1)
+            item.setData(0, ROLE_FOLDER, p.src is None)
+            item.setData(1, ROLE_SORT, p.bytes)
+            item.setData(2, ROLE_SORT, p.mtime or 0)
+            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+            for col in (0, 1, 2):
+                item.setForeground(col, pending_brush)
+            item.setForeground(3, QBrush(QColor("#c0392b")) if note.startswith(HINT_DUP) else note_brush)
+            item.setToolTip(0, p.src or "在光盘上新建的文件夹")
+            if p.src is None:
+                nodes[p.dst] = item
+            anc = parent
+            while anc is not None and anc is not t.invisibleRootItem():
+                expanded.add(anc.data(0, ROLE_PATH))
+                anc = anc.parent()
+        t.setSortingEnabled(True)
+        it = QTreeWidgetItemIterator(t)
+        while it.value():
+            node = it.value()
+            path = node.data(0, ROLE_PATH)
+            if path in expanded or (first_level and node.parent() is None):
+                node.setExpanded(True)
+            if (node.data(0, ROLE_KIND), path) in selected:
+                node.setSelected(True)
+            it += 1
+        t.verticalScrollBar().setValue(scroll)
+        self._selection_changed()
+
+    def _selection_changed(self):
+        folder = self._target_folder()
+        self.lb_target.setText("新文件放到：%s" % ("光盘根目录" if folder == "/" else folder))
+        self.btn_remove.setEnabled(bool(self.tree.selected_pending()) and not self._busy())
+
+    def _target_folder(self):
+        items = self.tree.selectedItems()
+        return FileTree.folder_for(items[0]) if items else "/"
 
     # ------------------------------------------------------------ 从光盘复制出来
 
@@ -977,13 +1368,15 @@ class MainWindow(QMainWindow):
         if self.burning:
             self.lb_stage.setText("正在写入光盘，请等写完再复制")
             return None
-        if self.media.foreign_data:
+        if self._udf_paths:
             iso, local = self._split_sources(dev, disc_paths)
             if not iso:
                 return local        # 全是 UDF 部分的，直接用挂载目录
         else:
-            local = B.local_paths(dev, disc_paths, allow_udf=False)
-            if local is None and B.is_drive(dev) and not B.IS_WINDOWS and not B.is_mounted(dev):
+            stale = dev in self._stale
+            local = None if stale else B.local_paths(dev, disc_paths, allow_udf=False)
+            if local is None and B.is_drive(dev) and not B.IS_WINDOWS and not B.is_mounted(dev) \
+                    and not stale:
                 B.mount_disc(dev)   # 和放入光盘时系统自动挂载一样
                 local = B.local_paths(dev, disc_paths, allow_udf=False)
             if local is not None:
@@ -994,7 +1387,7 @@ class MainWindow(QMainWindow):
         self.lb_stage.setText("正在从光盘取出文件……")
         QApplication.processEvents()
         try:
-            code, out = B.copy_out(dev, iso, self._tree_sbsector, local, dest)
+            code, out = B.copy_out(dev, iso, self._tree_sbsector, local, dest, self._udf_newer)
         finally:
             QApplication.restoreOverrideCursor()
         paths = [os.path.join(dest, B.disc_basename(p)) for p in disc_paths]
@@ -1012,7 +1405,9 @@ class MainWindow(QMainWindow):
         两部分都有的同名文件夹两边都取，复制时合并。"""
         iso = [p for p in paths if p in self._iso_paths]
         udf = [p for p in paths if p in self._udf_paths]
-        return iso, (B.local_paths(dev, udf) or []) if udf else []
+        if not udf or not self._udf_root:
+            return iso, []
+        return iso, [os.path.join(self._udf_root, *p.strip("/").split("/")) for p in udf]
 
     def _drag_dir(self):
         """拖出用的临时目录。文件管理器复制完才算用完，所以不马上删，下次拖出时清掉一小时前的。"""
@@ -1029,14 +1424,26 @@ class MainWindow(QMainWindow):
         os.makedirs(base, exist_ok=True)
         return tempfile.mkdtemp(dir=base)
 
-    def _disc_menu(self, pos):
-        if not self.tree_disc.selected_paths():
-            return
+    def _tree_menu(self, pos):
         menu = QMenu(self)
-        menu.addAction("复制到…", self.copy_out)
-        act = menu.addAction("从光盘删除（隐藏）…", self.hide_selected)
-        act.setEnabled(self._can_hide())
-        menu.exec_(self.tree_disc.viewport().mapToGlobal(pos))
+        disc = self.tree.selected_paths()
+        pending = self.tree.selected_pending()
+        if disc:
+            menu.addAction("复制到电脑…", lambda: self.copy_out())
+            act = menu.addAction("从光盘删除（隐藏）…", self.hide_selected)
+            act.setEnabled(self._can_hide())
+        if pending:
+            menu.addAction("不刻录了（从待刻录里去掉）", self._remove_selected)
+        if disc or pending:
+            menu.addSeparator()
+        folder = self._target_folder()
+        where = "光盘根目录" if folder == "/" else posixpath.basename(folder)
+        menu.addAction("添加文件到“%s”…" % where, self._pick_files)
+        menu.addAction("在“%s”里新建文件夹…" % where, lambda: self.new_folder())
+        for a in menu.actions():
+            if not a.isSeparator() and self._busy():
+                a.setEnabled(False)
+        menu.exec_(self.tree.viewport().mapToGlobal(pos))
 
     def _can_hide(self):
         m = self.media
@@ -1046,7 +1453,7 @@ class MainWindow(QMainWindow):
     def hide_selected(self):
         """一次性光盘上的“删除”：追加一个不含这些文件的新会话。"""
         dev = self.current_dev()
-        paths = self.tree_disc.selected_paths()
+        paths = self.tree.selected_paths()
         if not paths or not self._can_hide():
             return
         inside = [e for e in self.disc_entries if not e.is_dir and any(
@@ -1079,25 +1486,37 @@ class MainWindow(QMainWindow):
             self.chk_log.setChecked(True)
             QMessageBox.critical(self, APP_NAME, "写入失败（代码 %d）。\n\n详细日志：%s" % (code, log_path))
             return self.refresh_media()
-        try:
-            left = {e.path for e in B.list_disc_files(self.current_dev())} & set(hidden)
-        except Exception as e:  # 光驱不响应等；写入本身已成功
-            left, err = None, e
-        self.bar_progress.setValue(1000)
-        if left is None:
-            QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时出错：%s" % err)
-        elif left:
-            QMessageBox.warning(self, APP_NAME, "写入完成，但以下项目还在：\n" + "\n".join(sorted(left)))
-        else:
-            self.lb_stage.setText("已从光盘删除")
-            QMessageBox.information(self, APP_NAME, "已删除 %d 项，读回核对无误。" % len(hidden))
+
+        def check():    # 刷新时读出的目录就用来核对，不再单独读一遍
+            left = {e.path for e in self.disc_entries} & set(hidden)
+            self.bar_progress.setValue(1000)
+            if not self.media.present:
+                QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时读不出光盘。")
+            elif left:
+                QMessageBox.warning(self, APP_NAME, "写入完成，但以下项目还在：\n" + "\n".join(sorted(left)))
+            else:
+                self.lb_stage.setText("已从光盘删除")
+                QMessageBox.information(self, APP_NAME, "已删除 %d 项，读回核对无误。" % len(hidden))
+        self._after_read = check
         self.refresh_media()
+
+    def copy_all(self):
+        """把整张光盘复制到电脑上（混合盘的两部分都复制）。"""
+        if self._udf_unread():
+            return self._offer_read_all(then=self.copy_all)
+        if not self.disc_entries:
+            return QMessageBox.information(self, APP_NAME, "光盘上没有读出文件。")
+        self.tree.clearSelection()
+        for i in range(self.tree.topLevelItemCount()):
+            it = self.tree.topLevelItem(i)
+            if it.data(0, ROLE_KIND) == KIND_DISC:
+                it.setSelected(True)
+        self.copy_out()
 
     def copy_out(self, dest=None):
         dev = self.current_dev()
-        paths = self.tree_disc.selected_paths()
-        copying = getattr(self, "_copy_thread", None)
-        if not paths or self.job.running() or (copying and copying.isRunning()):
+        paths = self.tree.selected_paths()
+        if not paths or self._busy():
             return
         if dest is None:
             dest = QFileDialog.getExistingDirectory(self, "复制到", os.path.expanduser("~"))
@@ -1110,12 +1529,12 @@ class MainWindow(QMainWindow):
                 % "\n".join(clash[:10])) != QMessageBox.Yes:
             return
         self._copied = [os.path.join(dest, B.disc_basename(p)) for p in paths]
-        if self.media.foreign_data:
+        if self._udf_paths:
             # 混合盘：ISO 部分的用 xorriso 取，UDF 部分的从挂载目录复制
             iso, local = self._split_sources(dev, paths)
-            job = (B.copy_out, dev, iso, self._tree_sbsector, local, dest)
+            job = (B.copy_out, dev, iso, self._tree_sbsector, local, dest, self._udf_newer)
         else:
-            local = B.local_paths(dev, paths, allow_udf=False)
+            local = None if dev in self._stale else B.local_paths(dev, paths, allow_udf=False)
             job = (B.copy_local, local, dest) if local is not None else None
         if job:
             self._set_busy(True)
@@ -1145,90 +1564,129 @@ class MainWindow(QMainWindow):
             self.chk_log.setChecked(True)
             QMessageBox.critical(self, APP_NAME, "复制失败（代码 %d），详见日志。" % code)
 
-    # ------------------------------------------------------------ 待刻录列表
+    # ------------------------------------------------------------ 待刻录
 
     def _pick_files(self):
+        folder = self._target_folder()
         paths, _ = QFileDialog.getOpenFileNames(self, "选择要刻录的文件",
                                                 os.path.expanduser("~"))
-        self.add_paths(paths)
+        self.add_paths(paths, folder)
 
     def _pick_dir(self):
+        folder = self._target_folder()
         path = QFileDialog.getExistingDirectory(self, "选择要刻录的文件夹",
                                                 os.path.expanduser("~"))
         if path:
-            self.add_paths([path])
+            self.add_paths([path], folder)
 
-    def add_paths(self, paths):
-        existing = {self.tree_new.topLevelItem(i).data(0, Qt.UserRole)
-                    for i in range(self.tree_new.topLevelItemCount())}
+    def add_paths(self, paths, folder=None):
+        folder = folder or self._target_folder()
+        existing = {(p.src, p.folder) for p in self.pending}
         too_long = []
         for p in paths:
             p = os.path.abspath(p)
-            if p in existing or not os.path.exists(p):
+            if (p, folder) in existing or not os.path.exists(p):
                 continue
             size, count = B.local_size(p)
             too_long += B.long_names(p)
-            item = QTreeWidgetItem([os.path.basename(p) or p, B.human_size(size), "", ""])
-            item.setData(0, Qt.UserRole, p)
-            item.setData(1, Qt.UserRole, size)
-            item.setData(2, Qt.UserRole, count)
-            item.setIcon(0, QIcon.fromTheme("folder" if os.path.isdir(p) else "text-x-generic"))
-            item.setToolTip(0, p)
-            self.tree_new.addTopLevelItem(item)
-        self._update_pending()
+            self.pending.append(Pending(p, folder, size=size, count=count))
+        self._pending_changed()
         if too_long:
             QMessageBox.warning(
                 self, APP_NAME,
-                "以下名字超过 Joliet 的 %d 个 UTF-16 单元，刻录时会截短并保留扩展名。"
-                "本机原文件不改名，刻录前会显示改名对照：\n\n%s" %
+                "以下名字太长（Windows 光盘最多 %d 个字符，麒麟最多 85 个汉字），"
+                "刻到光盘上时会截短并保留扩展名，刻录前会显示改名对照。本机的原文件不改名：\n\n%s" %
                 (B.JOLIET_NAME_MAX, "\n".join(too_long[:10])))
 
+    def new_folder(self, name=None):
+        folder = self._target_folder()
+        if name is None:
+            name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：", QLineEdit.Normal,
+                                            datetime.date.today().strftime("%Y-%m-%d"))
+            if not ok:
+                return
+        name = name.strip().strip("/\\")
+        if not name or "/" in name or "\\" in name:
+            return QMessageBox.warning(self, APP_NAME, "文件夹名称不能为空，也不能含“/”或“\\”。")
+        dst = B.disc_join(folder, name)
+        on_disc = {e.path: e for e in self.disc_entries}
+        if dst in on_disc and not on_disc[dst].is_dir:
+            return QMessageBox.warning(self, APP_NAME, "光盘上已经有同名的文件：%s" % dst)
+        if dst not in on_disc and all(p.dst != dst for p in self.pending):
+            self.pending.append(Pending(None, folder, name=name))
+            self._pending_changed()
+        self._select_path(dst)
+
+    def _select_path(self, path):
+        it = QTreeWidgetItemIterator(self.tree)
+        while it.value():
+            if it.value().data(0, ROLE_PATH) == path:
+                self.tree.clearSelection()
+                it.value().setSelected(True)
+                self.tree.setCurrentItem(it.value())
+                self.tree.scrollToItem(it.value())
+                return
+            it += 1
+
     def _remove_selected(self):
-        for item in self.tree_new.selectedItems():
-            self.tree_new.takeTopLevelItem(self.tree_new.indexOfTopLevelItem(item))
-        self._update_pending()
+        drop = set(self.tree.selected_pending())
+        if not drop:
+            return
+        # 去掉新建的文件夹时，放进去的也一起去掉
+        gone = [self.pending[i].dst for i in drop if self.pending[i].src is None]
+        for i, p in enumerate(self.pending):
+            if any(p.folder == g or p.folder.startswith(g + "/") for g in gone):
+                drop.add(i)
+        self.pending = [p for i, p in enumerate(self.pending) if i not in drop]
+        if self._transfer and not any(p.transfer for p in self.pending):
+            self._drop_transfer()
+        self._pending_changed()
 
     def _clear_pending(self):
-        self.tree_new.clear()
-        self._update_pending()
+        self.pending = []
+        self._drop_transfer()
+        self._pending_changed()
+
+    def _pending_changed(self):
+        self._fill_tree()
+        self._update_capacity()
+        self._update_banner()
 
     def pending_items(self):
-        """[(本地路径, 光盘路径, 字节数, 文件数), ...]"""
-        target = self.ed_target.text().strip() or "/"
-        out = []
-        for i in range(self.tree_new.topLevelItemCount()):
-            it = self.tree_new.topLevelItem(i)
-            src = it.data(0, Qt.UserRole)
-            out.append((src, B.disc_join(target, os.path.basename(src)),
-                        it.data(1, Qt.UserRole) or 0, it.data(2, Qt.UserRole) or 0))
-        return out
+        """[(本地路径, 光盘路径, 字节数, 文件数), ...]；新建的空文件夹用一个空目录代替。"""
+        return [(p.src or self._empty_dir(), p.dst, p.size, p.count) for p in self.pending]
 
-    def _update_pending(self):
+    def _empty_dir(self):
+        path = os.path.join(STAGE_DIR, "empty")
+        os.makedirs(path, exist_ok=True)
+        for name in os.listdir(path):
+            shutil.rmtree(os.path.join(path, name), ignore_errors=True)
+        return path
+
+    def _pending_hints(self):
+        """{待刻录编号: 提示}：重名、替换光盘上的文件、并入已有文件夹。"""
         on_disc = {B.strip_version(e.path): e for e in self.disc_entries}
-        seen = set()
-        for i, (src, dst, _s, _c) in enumerate(self.pending_items()):
-            it = self.tree_new.topLevelItem(i)
-            it.setText(2, dst)
-            hint = ""
-            if dst in seen:
-                hint = "与其他项目重名"
+        hints, seen = {}, set()
+        for i, p in enumerate(self.pending):
+            dst = p.dst
+            if dst.casefold() in seen:
+                hints[i] = HINT_DUP
             elif dst in on_disc:
-                hint = "合并到已有文件夹" if on_disc[dst].is_dir and os.path.isdir(src) \
-                    else "将替换光盘上的同名文件"
-            seen.add(dst)
-            it.setText(3, hint)
-        self._update_capacity()
+                hints[i] = HINT_MERGE if on_disc[dst].is_dir and p.is_dir else HINT_REPLACE
+            seen.add(dst.casefold())
+        return hints
 
     def _update_capacity(self):
-        items = self.pending_items()
-        pending = sum(x[2] for x in items)
-        files = sum(x[3] for x in items)
+        items = self.pending
+        pending = sum(p.size for p in items)
+        files = sum(p.count for p in items)
         bar = self.bar_capacity
         is_image = not B.is_drive(self.current_dev())
         if is_image or not self.media.present:
             bar.setRange(0, 1)
             bar.setValue(0)
             bar.setFormat("待刻录 %s（%d 个文件）" % (B.human_size(pending), files))
+            bar.setStyleSheet("")
             return
         total = max(self.media.total_bytes, 1)
         need = pending + (B.estimate_overhead(files) if items else 0)
@@ -1250,6 +1708,99 @@ class MainWindow(QMainWindow):
                 "光盘以后只能读取，不能再追加任何文件。\n"
                 "一般只有要发给老旧设备（如某些 CD 机）读取时才需要封盘。")
 
+    # ------------------------------------------------------------ 转存到新光盘
+
+    def transfer_to_new_disc(self):
+        """含 UDF 的盘不能追加：先把盘上全部文件读到电脑上，再换空白盘刻成 ISO9660。"""
+        dev, m = self.current_dev(), self.media
+        if not B.is_drive(dev) or not m.present or self._busy() or self._transfer:
+            return
+        if self._udf_unread():
+            return self._offer_read_all(then=self.transfer_to_new_disc)
+        files = [e for e in self.disc_entries if not e.is_dir]
+        if not files:
+            return QMessageBox.information(self, APP_NAME, "光盘上没有读出文件。")
+        size = sum(e.size for e in files)
+        os.makedirs(STAGE_DIR, exist_ok=True)
+        free = shutil.disk_usage(STAGE_DIR).free
+        if free < size + 200 * 1024 * 1024:
+            return QMessageBox.warning(
+                self, APP_NAME, "要先把盘上 %s 的文件读到电脑上，但 %s 所在的磁盘只剩 %s。"
+                % (B.human_size(size), STAGE_DIR, B.human_size(free)))
+        if QMessageBox.question(
+                self, "转存到新光盘",
+                "把这张盘上的全部 %d 个文件（%s）转存到一张新光盘上：\n\n"
+                "1. 先把文件读到电脑上的临时文件夹\n"
+                "2. 读完自动弹出这张盘，请换一张空白光盘\n"
+                "3. 点“开始刻录”，刻成 Windows 和麒麟都能直接读、以后也能继续追加的格式\n\n"
+                "原来这张盘不会改动。待刻录里已有的文件也会一起刻上去。\n\n现在开始吗？"
+                % (len(files), B.human_size(size))) != QMessageBox.Yes:
+            return
+        stage = tempfile.mkdtemp(prefix="transfer-", dir=STAGE_DIR)
+        tops = B.top_level(["/" + e.path.strip("/").split("/")[0] for e in self.disc_entries])
+        if self._udf_paths:
+            iso, local = self._split_sources(dev, tops)
+            job = (B.copy_out, dev, iso, self._tree_sbsector, local, stage, self._udf_newer)
+        else:
+            job = (B.copy_out, dev, tops, self._tree_sbsector, [], stage)
+        self._transfer = dict(stage=stage, files=len(files), size=size, volid=m.volume_id)
+        self._set_busy(True)
+        self.lb_stage.setText("正在把光盘上的文件读到电脑上……")
+        self._copy_thread = FuncThread(*job)
+        self._copy_thread.done.connect(self._transfer_staged)
+        self._copy_thread.start()
+
+    def _transfer_staged(self, result):
+        self._set_busy(False)
+        code, msg = (1, str(result)) if isinstance(result, Exception) else result
+        self._log(msg)
+        t = self._transfer
+        if code != 0 or t is None:
+            self._drop_transfer()
+            self.chk_log.setChecked(True)
+            self.lb_stage.setText("读取失败")
+            return QMessageBox.critical(self, APP_NAME, "从光盘读出文件失败，原盘没有改动：\n\n%s" % msg)
+        B.make_writable([t["stage"]])
+        staged = [Pending(os.path.join(t["stage"], n), "/", transfer=True)
+                  for n in sorted(os.listdir(t["stage"]))]
+        for p in staged:
+            p.size, p.count = B.local_size(p.src)
+        self.pending = staged + [p for p in self.pending if not p.transfer]
+        if t["volid"] and not B.check_volid(t["volid"]):
+            self.ed_volid.setText(t["volid"])
+        self.lb_stage.setText("已读到电脑上")
+        self._pending_changed()
+        dev = self.current_dev()
+        B.unmount(dev)
+        self._run(B.eject_args(dev), lambda c, o: self._ejected(), "正在弹出……")
+        QMessageBox.information(
+            self, "转存到新光盘",
+            "已把原盘的 %d 个文件（%s）读到电脑上，原盘已弹出。\n\n"
+            "请放入一张空白光盘，软件读出后点“开始刻录”。" % (t["files"], B.human_size(t["size"])))
+
+    def cancel_transfer(self):
+        self.pending = [p for p in self.pending if not p.transfer]
+        self._drop_transfer()
+        self._pending_changed()
+
+    def _drop_transfer(self):
+        t, self._transfer = self._transfer, None
+        if t:
+            shutil.rmtree(t["stage"], ignore_errors=True)
+
+    def _clean_old_stage(self):
+        """上次异常退出留下的临时文件：两天以前的删掉（不动其他正在运行的实例的）。"""
+        if not os.path.isdir(STAGE_DIR):
+            return
+        now = time.time()
+        for name in os.listdir(STAGE_DIR):
+            p = os.path.join(STAGE_DIR, name)
+            try:
+                if name != "empty" and now - os.path.getmtime(p) > 2 * 86400:
+                    shutil.rmtree(p, ignore_errors=True)
+            except OSError:
+                pass
+
     # ------------------------------------------------------------ 刻录
 
     def burn(self):
@@ -1259,28 +1810,24 @@ class MainWindow(QMainWindow):
         if not dev or dev == IMAGE_ITEM:
             return QMessageBox.warning(self, APP_NAME, "请先选择刻录机。")
         if not items:
-            return QMessageBox.information(self, APP_NAME, "请先添加要刻录的文件。")
+            return QMessageBox.information(self, APP_NAME, "请先添加要刻录的文件：点“添加文件…”，"
+                                           "或者把文件直接拖到列表里。")
         if not m.present:
-            return QMessageBox.warning(self, APP_NAME, "未检测到光盘，请放入光盘后点“刷新”。")
+            return QMessageBox.warning(self, APP_NAME, "光驱里没有光盘，请放入光盘。")
         if m.needs_repair:
             return QMessageBox.warning(
-                self, APP_NAME, "此盘有未关闭的会话，请先点“修复未关闭会话”。")
+                self, APP_NAME, "此盘有未关闭的会话，请先点上方提示条里的“修复”。")
         if m.closed:
             return QMessageBox.warning(self, APP_NAME, "此盘已封盘，无法再写入。请换一张光盘。")
         if self._udf_write_blocked(dev):
             return
-        udf_src = None
-        if m.foreign_data:
-            # 盘上有 UDF：只能追加 ISO9660 会话，得先把 UDF 里的文件读出来一起刻进去
-            udf_src = self._udf_source(dev)
-            if udf_src is None:
-                return self._offer_udf_mount(dev)
         if not m.can_write:
             return QMessageBox.warning(self, APP_NAME, "此盘当前不可写入（%s）。" % m.status_text())
-        missing = [s for s, _d, _z, _c in items if not os.path.exists(s)]
+        missing = [p.src for p in self.pending if p.src and not os.path.exists(p.src)]
         if missing:
             return QMessageBox.warning(self, APP_NAME, "以下文件已不存在：\n" + "\n".join(missing))
-        dups = [it.text(2) for it in self._items() if it.text(3) == "与其他项目重名"]
+        hints = self._pending_hints()
+        dups = [self.pending[i].dst for i, h in hints.items() if h == HINT_DUP]
         if dups:
             return QMessageBox.warning(self, APP_NAME, "光盘上会出现重名：\n" + "\n".join(dups))
         volid = self.ed_volid.text().strip()
@@ -1290,57 +1837,37 @@ class MainWindow(QMainWindow):
 
         pending = sum(x[2] for x in items)
         need = pending + B.estimate_overhead(sum(x[3] for x in items))
-        udf_n = udf_bytes = 0
-        if udf_src:
-            plan = self._udf_plan(udf_src, extra=need)
-            if plan is None:
-                return
-            udf_n, udf_bytes = plan
-        elif B.is_drive(dev) and need > m.free_bytes:
+        if B.is_drive(dev) and need > m.free_bytes:
             return QMessageBox.warning(
                 self, APP_NAME, "空间不足：需要约 %s，光盘剩余 %s。" %
                 (B.human_size(need), B.human_size(m.free_bytes)))
 
-        replaced = [it.text(2) for it in self._items() if it.text(3) == "将替换光盘上的同名文件"]
+        replaced = [self.pending[i].dst for i, h in hints.items() if h == HINT_REPLACE]
         keep_open = self.chk_open.isChecked()
         lines = ["刻录 %d 项，共 %s" % (len(items), B.human_size(pending)),
                  "目标：%s" % self.cb_drive.currentText(),
-                 "卷标：%s" % (volid or "（不设置）"),
+                 "光盘名称：%s" % (volid or "（不设置）"),
                  "刻录后：%s" % ("保持可追加" if keep_open else "封盘（以后不能再写入！）")]
+        if self._transfer:
+            lines.append("\n其中包括从原盘转存的 %d 个文件。" % self._transfer["files"])
         if replaced:
             lines.append("\n以下光盘上的旧文件会被新文件替换（旧文件仍占用空间）：\n" +
                          "\n".join(replaced[:10]))
-        fixups, shorts = [], []
-        if udf_src:
-            # 左边列的是 UDF 里的文件，不是要导入的 ISO 目录，“;1”和短名的检查都不适用
-            lines.append("\n这张盘上有 UDF 格式的文件（一般是 Windows 写的）。本软件只能追加 ISO9660 会话："
-                         "会先把 UDF 里现有的 %d 个文件（%s）读到本机临时目录，再和这次的文件一起刻进新会话%s。"
-                         "\nUDF 里的文件要再占 %s；刻完后 Windows 和麒麟上都能看到全部文件，"
-                         "以后这张盘也能一直用本软件追加。"
-                         % (udf_n, B.human_size(udf_bytes),
-                            "，前面 ISO 部分的文件也都保留" if m.iso_hidden else "",
-                            B.human_size(udf_bytes)))
-        else:
-            fixups = B.version_fixups([e.path for e in self.disc_entries if not e.is_dir])
-            shorts = [e.path for e in self.disc_entries
-                      if not e.is_dir and B.is_short_name(os.path.basename(e.path))]
+        fixups = B.version_fixups([e.path for e in self.disc_entries if not e.is_dir])
+        shorts = [e.path for e in self.disc_entries
+                  if not e.is_dir and B.is_short_name(os.path.basename(e.path))]
         if fixups:
             lines.append("\n同时修正 %d 个带“;1”的旧文件名（系统 xorriso 版本较老，不修正的话 Windows 上会变成 xxx_1）。"
                          % len(fixups))
         if shorts:
-            lines.append("\n注意：盘上有 %d 个文件只剩短文件名（如 %s）。建议先取消，用“光盘诊断 → "
+            lines.append("\n注意：盘上有 %d 个文件只剩短文件名（如 %s）。建议先取消，用“更多功能 → "
                          "恢复长文件名”找回原名；否则本次追加后它们仍是短名。"
                          % (len(shorts), os.path.basename(shorts[0])))
         if QMessageBox.question(self, "确认刻录", "\n".join(lines)) != QMessageBox.Yes:
             return
-
-        burn = dict(dev=dev, items=[(s, d) for s, d, _z, _c in items], volid=volid,
-                    close=not keep_open, fixups=fixups,
-                    sbsector=m.last_iso_start if m.iso_hidden else None)
-        if udf_src:
-            self._stage_then_burn(udf_src, burn)
-        else:
-            self._start_burn(**burn)
+        normalize = [p.dst for p in self.pending if p.transfer]
+        self._start_burn(dev, [(s, d) for s, d, _z, _c in items], volid, not keep_open,
+                         fixups=fixups, normalize=normalize)
 
     def _udf_write_blocked(self, dev):
         if not B.is_drive(dev):
@@ -1349,22 +1876,24 @@ class MainWindow(QMainWindow):
             self.media.udf_history = B.has_udf_history(dev, self.media)
         if not (self.media.udf_history or self.media.foreign_data):
             return False
-        QMessageBox.warning(
-            self, APP_NAME,
-            "这张盘包含 UDF，原盘追加 ISO 后 Windows 可能仍显示旧目录。"
-            "已停止写盘。请先复制文件到本机，再换空白光盘刻录；原盘保持不变。")
+        if self._transfer:
+            QMessageBox.warning(self, APP_NAME, "这还是含 UDF 格式的那张盘，不能往里写。请换一张空白光盘。")
+            return True
+        if QMessageBox.question(
+                self, APP_NAME,
+                "这张盘含有 UDF 格式（一般是 Windows 刻的），不能再往里追加："
+                "追加的内容在 Windows 上看不到（Windows 自带的刻录往这种盘上追加也一样）。\n\n"
+                "可以“转存到新光盘”：把这张盘上的文件和这次要刻的文件一起刻到一张空白光盘上，"
+                "原盘不改动。\n\n现在转存吗？") == QMessageBox.Yes:
+            QTimer.singleShot(0, self.transfer_to_new_disc)
         return True
 
     def _start_burn(self, dev, items, volid, close, fixups=(), sbsector=None, normalize=()):
         if self._udf_write_blocked(dev):
-            self._drop_stage()
-            self._converting = False
             return
         try:
             name_plan = B.plan_burn_names(self.disc_entries, items, fixups)
         except (OSError, ValueError) as e:
-            self._drop_stage()
-            self._converting = False
             return QMessageBox.warning(self, APP_NAME, str(e))
         if name_plan.changes:
             preview = "\n".join("%s → %s" % pair for pair in name_plan.changes[:20])
@@ -1374,18 +1903,36 @@ class MainWindow(QMainWindow):
                     self, "确认光盘文件名",
                     "以下名称将按 Joliet 上限截短，保留扩展名；重名时加编号。"
                     "本机原文件不改名：\n\n%s\n\n按这些名称刻录吗？" % preview) != QMessageBox.Yes:
-                self._drop_stage()
-                self._converting = False
                 return
+        exclude = ()
+        if B.IS_WINDOWS:
+            os.makedirs(STAGE_DIR, exist_ok=True)
+            self._alias_dir = tempfile.mkdtemp(prefix="alias-", dir=STAGE_DIR)
+            try:
+                items, exclude, problems = B.cygwin_safe_items(items, self._alias_dir)
+            except OSError as e:
+                self._drop_alias()
+                return QMessageBox.warning(self, APP_NAME, "准备超长文件名时出错：%s" % e)
+            if problems:
+                self._drop_alias()
+                return QMessageBox.warning(
+                    self, APP_NAME, "以下文件夹的名字太长（超过 85 个汉字），刻录程序打不开，"
+                    "请先改短再刻录：\n\n%s" % "\n".join(problems[:10]))
         self._release_drive(dev, remount=not self._eject_after(dev))
         args = B.burn_args(
             dev, items, volid=volid, close=close, speed=self.cb_speed.currentData(),
             verify=self.chk_verify.isChecked(), eject=self._eject_after(dev),
-            fixups=fixups, sbsector=sbsector, normalize=normalize, name_plan=name_plan)
+            fixups=fixups, sbsector=sbsector, normalize=normalize, name_plan=name_plan,
+            exclude=exclude)
         self.log.clear()
         self._run(args, self._burn_done, "正在准备刻录……", burning=True)
 
-    # UDF 盘的追加：挂载 UDF 部分 → 读到本机临时目录 → 和新文件一起刻成 ISO 会话
+    def _drop_alias(self):
+        path, self._alias_dir = getattr(self, "_alias_dir", None), None
+        if path:
+            shutil.rmtree(path, ignore_errors=True)
+
+    # 盘上的 UDF 部分：挂载后才能列出、复制
 
     def _udf_source(self, dev):
         m = B.mount_info(dev) if B.is_drive(dev) else None
@@ -1396,20 +1943,24 @@ class MainWindow(QMainWindow):
             return self.media.last_iso_start
         return B.find_udf_session(dev, B.parse_tracks(self.media.raw)) if B.is_drive(dev) else None
 
-    def _offer_udf_mount(self, dev, then=None, why="要往里追加，得先挂载 UDF 部分，把这些文件一起刻进新会话"):
-        start = self._udf_start(dev)
-        if start is None:
-            return QMessageBox.warning(
-                self, APP_NAME, "此盘上的数据不是 ISO9660 格式，也没认出是 UDF，追加后原内容会不可见，已停止。")
-        if QMessageBox.question(
-                self, APP_NAME, "这张盘上有 UDF 格式的文件（一般是 Windows 写的）。%s%s。\n\n现在挂载吗？"
-                % (why, "（会弹出输入管理员密码的窗口）" if start else "")) != QMessageBox.Yes:
+    def _offer_read_all(self, then=None):
+        dev = self.current_dev()
+        if not self._udf_unread() or self._busy():
             return
-        self._mount_udf(dev, start, then or self.burn)
+        start = self._udf_start(dev)
+        what = ("这张光盘上有一部分文件是 Windows 用 UDF 格式写的（一般是“类似 USB 闪存驱动器”方式），"
+                "系统默认读不到。\n\n现在把它们也读出来吗？" if self.media.has_iso else
+                "这张光盘是 Windows 用 UDF 格式写的（一般是“类似 USB 闪存驱动器”方式），"
+                "系统还没有打开它。\n\n现在读出盘上的文件吗？")
+        if QMessageBox.question(
+                self, "读出光盘上的全部文件",
+                what + "\n（可能要输入管理员密码；本软件关闭时会自动卸载。）") != QMessageBox.Yes:
+            return
+        self._mount_udf(dev, start, then)
 
-    def _mount_udf(self, dev, start, then):
+    def _mount_udf(self, dev, start, then=None):
         self._set_busy(True)
-        self.lb_stage.setText("正在挂载 UDF 部分……")
+        self.lb_stage.setText("正在读取 UDF 部分……")
         self._mount_then = then
         self._mount_thread = FuncThread(B.mount_disc, dev, start)
         self._mount_thread.done.connect(self._udf_mounted)
@@ -1420,154 +1971,50 @@ class MainWindow(QMainWindow):
         self.lb_stage.setText("就绪")
         path, msg = (None, str(result)) if isinstance(result, Exception) else result
         if not path or self._udf_source(self.current_dev()) is None:
-            return QMessageBox.warning(self, APP_NAME, "挂载 UDF 部分失败：\n\n%s" % msg)
+            return QMessageBox.warning(self, APP_NAME, "读取 UDF 部分失败：\n\n%s" % msg)
         then, self._mount_then = self._mount_then, None
-        then()      # 挂上了，接着做原来要做的事
-
-    # 混合格式 / UDF 盘：放进来就自动读出全部文件，再问要不要修复成 ISO9660
-
-    def _can_fix_fs(self):
-        m = self.media
-        return (B.is_drive(self.current_dev()) and m.present and (m.foreign_data or m.udf_history)
-                and not m.needs_repair and not self.job.running())
-
-    def _offer_read_all(self):
-        dev = self.current_dev()
-        if not self.media.foreign_data or self.job.running():
-            return
-        if self._udf_source(dev):
-            return self._offer_fs_fix()
-        start = self._udf_start(dev)
-        if start is None:
-            return
-        part = "前面 ISO 部分的文件已列在左边，后来" if self.media.iso_hidden else ""
-        if QMessageBox.question(
-                self, "读出光盘上的全部文件",
-                "这张光盘有 Windows 用 UDF 格式写的文件（一般是“类似 USB 闪存驱动器”方式），"
-                "%s写的这些文件系统默认读不到。\n\n现在读出全部文件吗？%s"
-                % (part, "\n（要输入管理员密码。程序关闭时会自动卸载。）" if start else "")) \
-                != QMessageBox.Yes:
-            return
-        self._mount_udf(dev, start, self._read_all_done)
-
-    def _read_all_done(self):
-        self._after_read_all = True     # 刷新完列出全部文件后，接着问要不要修复
+        self._after_read = then     # 重新列出全部文件后，接着做原来要做的事
         self.refresh_media()
-
-    def _offer_fs_fix(self):
-        # 不再自动提示原盘转换。需要复制时由用户点击“复制全部到本机”。
-        return
-
-    def _udf_plan(self, udf_src, extra=0):
-        """要读出来重刻的 UDF 文件：(文件数, 字节数)；空间不够时提示并返回 None。"""
-        files = [e for e in B.walk_mount(udf_src) if not e.is_dir]
-        size = sum(e.size for e in files)
-        need = size + extra + B.estimate_overhead(len(files))
-        m = self.media
-        if need > m.free_bytes:
-            QMessageBox.warning(self, APP_NAME, "空间不足：需要约 %s，光盘剩余 %s。"
-                                % (B.human_size(need), B.human_size(m.free_bytes)))
-            return None
-        os.makedirs(STAGE_DIR, exist_ok=True)
-        free = shutil.disk_usage(STAGE_DIR).free
-        if free < size + 200 * 1024 * 1024:
-            QMessageBox.warning(self, APP_NAME, "要先把 UDF 里的 %s 文件读到本机，但 %s 所在的磁盘只剩 %s。"
-                                % (B.human_size(size), STAGE_DIR, B.human_size(free)))
-            return None
-        return len(files), size
-
-    def convert_to_iso(self, ask=True):
-        """先复制文件到本机，再用新盘转换；不向已有 UDF 的原盘追加 ISO。"""
-        if not self._can_fix_fs():
-            return
-        dev = self.current_dev()
-        if self.media.foreign_data and self._udf_source(dev) is None:
-            def read_before_copy():
-                self._copy_after_media = lambda: self.convert_to_iso(ask=ask)
-                self.refresh_media()
-            return self._offer_udf_mount(dev, read_before_copy, "复制前需要先读取 UDF 部分")
-        if not self.disc_entries:
-            return QMessageBox.information(self, APP_NAME, "当前没有可复制的文件，请先完成光盘诊断和挂载。")
-        if ask:
-            text = ("将当前可读的全部文件复制到本机，不改写原盘。"
-                    "复制完成后，换一张空白光盘并添加这些文件，即可刻成兼容的 ISO9660 数据盘。")
-            if not B.IS_WINDOWS and any("?" in e.path or "_#" in e.path for e in self.disc_entries):
-                text += ("\n\n当前 UDF 目录有疑似经过系统字符转换的名称。复制不能恢复原名，"
-                         "请先在 Windows 核对这类文件的原始名称。")
-            QMessageBox.information(self, APP_NAME, text)
-        self.tree_disc.selectAll()
-        self.copy_out()
-
-    def _stage_then_burn(self, udf_src, burn):
-        os.makedirs(STAGE_DIR, exist_ok=True)
-        # 其他实例可能正在读这些文件刻录，只清理本实例拥有的目录。
-        self._stage = tempfile.mkdtemp(prefix="job-", dir=STAGE_DIR)
-        self._pending_burn = burn
-        self._set_busy(True, True)
-        self.lb_stage.setText("正在把 UDF 里的文件读到本机……")
-        self._stage_thread = FuncThread(B.stage_udf, udf_src, self._stage)
-        self._stage_thread.done.connect(self._staged)
-        self._stage_thread.start()
-
-    def _staged(self, result):
-        self._set_busy(False)
-        code, msg = (1, str(result)) if isinstance(result, Exception) else result
-        self._log(msg)
-        burn, self._pending_burn = self._pending_burn, None
-        if code != 0:
-            self._drop_stage()
-            self._converting = False
-            self.chk_log.setChecked(True)
-            return QMessageBox.critical(self, APP_NAME, "从光盘读出 UDF 里的文件失败，没有写盘：\n\n%s" % msg)
-        staged = [(os.path.join(self._stage, n), "/" + n) for n in sorted(os.listdir(self._stage))]
-        # UDF 的文件在前，这次加的在后：同名时以这次加的为准
-        burn["items"] = staged + burn["items"]
-        burn["normalize"] = [d for _, d in staged]
-        self._start_burn(**burn)
-
-    def _drop_stage(self):
-        if self._stage:
-            shutil.rmtree(self._stage, ignore_errors=True)
-            self._stage = None
 
     def _eject_after(self, dev):
         """镜像文件没有可弹出的东西，只对光驱生效。"""
         return self.chk_eject.isChecked() and B.is_drive(dev)
 
-    def _items(self):
-        return [self.tree_new.topLevelItem(i) for i in range(self.tree_new.topLevelItemCount())]
-
     def _burn_done(self, code, out):
-        self._drop_stage()
-        converting, self._converting = self._converting, False
+        self._drop_alias()
         log_path = self._save_log(out)
-        if code == 0 and not B.md5_mismatch(out) and converting:
-            self.bar_progress.setValue(1000)
-            self.lb_stage.setText("ISO 会话已写入")
-            QMessageBox.information(
-                self, APP_NAME, "ISO 会话已写入，MD5 校验通过。")
-        elif code == 0 and not B.md5_mismatch(out):
+        ok = code == 0 and not B.md5_mismatch(out)
+        if ok:
+            transfer = self._transfer
             self.bar_progress.setValue(1000)
             self.lb_stage.setText("刻录完成")
-            self.tree_new.clear()
-            msg = "刻录完成。"
-            if self.chk_verify.isChecked():
-                msg += "\n校验通过，数据与原文件一致。"
-            if self.chk_open.isChecked():
-                msg += "\n光盘保持可追加，下次可以继续往里加文件。"
+            self.pending = []
+            self._drop_transfer()
+            if transfer:
+                msg = ("转存完成：原盘的 %d 个文件已刻到新光盘上%s。\n\n"
+                       "新光盘在 Windows 和麒麟上都能直接打开，以后也能继续追加。"
+                       "原来那张盘没有改动，可以留作备份。"
+                       % (transfer["files"], "，校验通过" if self.chk_verify.isChecked() else ""))
+            else:
+                msg = "刻录完成。"
+                if self.chk_verify.isChecked():
+                    msg += "\n校验通过，数据与原文件一致。"
+                if self.chk_open.isChecked():
+                    msg += "\n光盘保持可追加，下次可以继续往里加文件。"
+                if self.current_dev() in self._stale:
+                    msg += "\n\n光盘没有弹出：文件管理器要弹出光盘再放入，才会显示刚刻的文件。"
             QMessageBox.information(self, APP_NAME, msg)
         else:
             self.lb_stage.setText("刻录失败")
             self.chk_log.setChecked(True)
             reason = "校验不一致，光盘数据可能有误。" if B.md5_mismatch(out) else \
                 "xorriso 返回错误（代码 %d）。" % code
-            QMessageBox.critical(self, APP_NAME, "刻录失败：%s\n\n详细日志：%s" % (reason, log_path))
+            QMessageBox.critical(self, APP_NAME, "刻录失败：%s\n\n待刻录的文件还在列表里，"
+                                 "可以换一张光盘再试。\n\n详细日志：%s" % (reason, log_path))
         if not self._eject_after(self.current_dev()):
             self.refresh_media()
         else:
-            self.media = B.MediaInfo()
-            self.tree_disc.clear()
-            self._show_media()
+            self._ejected()
 
     def _save_log(self, out):
         try:
@@ -1610,7 +2057,7 @@ class MainWindow(QMainWindow):
         dlg = DiagDialog(self, dev)
         dlg.exec_()
         if dlg.mount_changed and not self.job.running():
-            self.refresh_media()    # 挂上了 UDF 部分时，左边改列它的文件
+            self.refresh_media()    # 挂上了 UDF 部分时，列表里补上它的文件
         return dlg
 
     def recover_names(self, dev):
@@ -1636,26 +2083,24 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, APP_NAME, "写入失败（代码 %d）。\n\n详细日志：%s" % (code, log_path))
             self.refresh_media()
             return
-        # 读回核对：新名字都在、旧名字都没了
-        dev = self.current_dev()
-        try:
-            names = {e.path for e in B.list_disc_files(dev)}
-        except Exception as e:  # 光驱不响应等；写入本身已成功
-            QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时出错：%s\n\n"
-                                "请弹出光盘再放入，用“光盘诊断”确认文件名。" % e)
-            self.refresh_media()
-            return
-        bad = [r for r in renames if r.new not in names or r.old in names]
-        self.bar_progress.setValue(1000)
-        if bad:
-            self.lb_stage.setText("改名后核对有问题")
-            QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时以下文件不对：\n" +
-                                "\n".join("%s → %s" % (r.old, r.new) for r in bad))
-        else:
-            self.lb_stage.setText("长文件名已恢复")
-            n = sum(1 for r in renames if r.session >= 0)
-            QMessageBox.information(self, APP_NAME, "已恢复 %d 个文件的长文件名，读回核对无误。\n\n"
-                                    "Windows 和麒麟上都会显示原来的中文名。" % n)
+
+        def check():    # 读回核对：新名字都在、旧名字都没了
+            names = {e.path for e in self.disc_entries}
+            if not self.media.present:
+                return QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时读不出光盘。\n\n"
+                                           "请弹出光盘再放入，用“光盘诊断”确认文件名。")
+            bad = [r for r in renames if r.new not in names or r.old in names]
+            self.bar_progress.setValue(1000)
+            if bad:
+                self.lb_stage.setText("改名后核对有问题")
+                QMessageBox.warning(self, APP_NAME, "写入完成，但读回核对时以下文件不对：\n" +
+                                    "\n".join("%s → %s" % (r.old, r.new) for r in bad))
+            else:
+                self.lb_stage.setText("长文件名已恢复")
+                n = sum(1 for r in renames if r.session >= 0)
+                QMessageBox.information(self, APP_NAME, "已恢复 %d 个文件的长文件名，读回核对无误。\n\n"
+                                        "Windows 和麒麟上都会显示原来的中文名。" % n)
+        self._after_read = check
         self.refresh_media()
 
     def repair(self, ask=True):
@@ -1698,31 +2143,42 @@ class MainWindow(QMainWindow):
 
     def eject(self):
         dev = self.current_dev()
-        if not B.is_drive(dev):
+        if not B.is_drive(dev) or self._busy():
             return
         B.unmount(dev)
         self._run(B.eject_args(dev), lambda c, o: self._ejected(), "正在弹出……")
 
     def _ejected(self):
+        self._stale.discard(self.current_dev())
         self._repair_prompted = ""
+        self._fs_prompted = ""
+        self._present = False
         self.media = B.MediaInfo()
-        self.tree_disc.clear()
+        self._set_entries([], [])
         self.lb_stage.setText("就绪")
         self._show_media()
+        self._fill_tree()
 
     def closeEvent(self, e):
         if self.burning and self.job.running():
             QMessageBox.warning(self, APP_NAME, "正在写入光盘，请等待完成，中途关闭会损坏光盘。")
             e.ignore()
             return
-        staging = getattr(self, "_stage_thread", None)
-        if staging and staging.isRunning():
-            QMessageBox.warning(self, APP_NAME, "正在读出 UDF 里的文件，读完就开始刻录，请稍候。")
+        copying = getattr(self, "_copy_thread", None)
+        if copying and copying.isRunning():
+            QMessageBox.warning(self, APP_NAME, "正在从光盘读取文件，请等读完再关闭。")
             e.ignore()
             return
+        if self._transfer and QMessageBox.question(
+                self, APP_NAME, "转存的文件还没刻到新光盘上。关闭后会删除已读到电脑上的临时文件"
+                "（原盘不受影响，以后可以重新转存）。\n\n确定关闭吗？") != QMessageBox.Yes:
+            e.ignore()
+            return
+        self._poll_timer.stop()
         if self.job.running():
             self.job.proc.kill()
             self.job.proc.waitForFinished(3000)
+        self._drop_transfer()
         B.release_all_mounts()      # 本程序挂上的 UDF 部分卸掉，不留在系统里
         e.accept()
 

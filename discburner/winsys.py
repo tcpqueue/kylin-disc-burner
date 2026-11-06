@@ -88,3 +88,23 @@ def dismount(letter):
                                          ctypes.byref(n), None))
     finally:
         _k32.CloseHandle(h)
+
+
+FILE_READ_ATTRIBUTES = 0x80
+IOCTL_STORAGE_CHECK_VERIFY2 = 0x002D0800
+
+
+def media_present(letter):
+    """光驱里有没有盘（空白盘也算）。不读盘、不让光驱转起来，可以经常调用。
+    打不开光驱时返回 None。"""
+    with _QuietErrors():
+        h = _k32.CreateFileW(r"\\.\%s:" % letter, FILE_READ_ATTRIBUTES, 3, None,
+                             OPEN_EXISTING, 0, None)
+    if h == _INVALID_HANDLE:
+        return None
+    try:
+        n = wintypes.DWORD()
+        return bool(_k32.DeviceIoControl(h, IOCTL_STORAGE_CHECK_VERIFY2, None, 0, None, 0,
+                                         ctypes.byref(n), None))
+    finally:
+        _k32.CloseHandle(h)
