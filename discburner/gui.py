@@ -13,12 +13,12 @@ import time
 
 from PyQt5.QtCore import (QFileInfo, QMimeData, QObject, QProcess, QSettings, Qt, QThread, QTimer,
                           QUrl, pyqtSignal, qVersion)
-from PyQt5.QtGui import QBrush, QColor, QDrag, QFont, QFontDatabase, QIcon, QPalette
+from PyQt5.QtGui import QBrush, QColor, QDrag, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
     QFileIconProvider, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
     QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator,
+    QPushButton, QSizePolicy, QToolButton, QTreeWidget, QTreeWidgetItem, QTreeWidgetItemIterator,
     QVBoxLayout, QWidget)
 
 from . import __version__
@@ -409,6 +409,20 @@ class RecoverDialog(QDialog):
         super(RecoverDialog, self).reject()
 
 
+def faded_icon(icon, size=16, opacity=0.45):
+    """待刻录项目用的半透明图标。"""
+    src = icon.pixmap(size, size)
+    if src.isNull():
+        return icon
+    out = QPixmap(src.size())
+    out.fill(Qt.transparent)
+    p = QPainter(out)
+    p.setOpacity(opacity)
+    p.drawPixmap(0, 0, src)
+    p.end()
+    return QIcon(out)
+
+
 ROLE_PATH = Qt.UserRole          # 盘上路径
 ROLE_KIND = Qt.UserRole + 1      # KIND_DISC / KIND_PENDING
 ROLE_PENDING = Qt.UserRole + 2   # 待刻录项目在 MainWindow.pending 里的编号
@@ -678,7 +692,7 @@ class MainWindow(QMainWindow):
         row = QHBoxLayout()
         row.addWidget(QLabel("刻录机："))
         self.cb_drive = QComboBox()
-        self.cb_drive.setMinimumWidth(360)
+        self.cb_drive.setMinimumWidth(260)
         self.cb_drive.activated.connect(self._drive_chosen)
         row.addWidget(self.cb_drive, 1)
         self.btn_refresh = QPushButton("刷新")
@@ -741,11 +755,13 @@ class MainWindow(QMainWindow):
         self.lb_target = QLabel()
         self.lb_target.setTextFormat(Qt.PlainText)
         brow.addSpacing(12)
-        brow.addWidget(self.lb_target, 1)
-        self.lb_legend = QLabel("颜色浅的是待刻录的；可以把文件直接拖进来，拖到文件夹上就放进那个文件夹")
+        brow.addWidget(self.lb_target)
+        self.lb_legend = QLabel("（颜色浅的是待刻录的，可以直接把文件拖到列表里的文件夹上）")
         self.lb_legend.setStyleSheet("color:gray")
+        self.lb_legend.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)   # 窗口窄时截掉，不撑宽窗口
+        self.lb_legend.setToolTip(self.lb_legend.text())
+        brow.addWidget(self.lb_legend, 1)
         v.addLayout(brow)
-        v.addWidget(self.lb_legend)
 
         # 选项
         g_opt = QGroupBox("刻录选项")
@@ -1108,10 +1124,16 @@ class MainWindow(QMainWindow):
             return
         self.lb_stage.setText("就绪")
         m = self.media
-        if m.has_iso and m.volume_id and not self.ed_volid.text():
-            self.ed_volid.setText(m.volume_id)
-        elif m.blank and not self.ed_volid.text():
-            self.ed_volid.setText("光盘" + datetime.date.today().strftime("%Y-%m-%d"))
+        # 光盘名称跟着光盘走：用户自己改过的不动，自动填的换盘后换成新盘的
+        typed = self.ed_volid.text().strip()
+        if not typed or typed == getattr(self, "_auto_volid", None):
+            auto = m.volume_id if m.has_iso and m.volume_id else \
+                "光盘" + datetime.date.today().strftime("%Y-%m-%d") if m.blank else typed
+            if self._transfer and self._transfer.get("volid") and not m.has_iso:
+                auto = self._transfer["volid"]
+            if auto != typed:
+                self.ed_volid.setText(auto)
+            self._auto_volid = auto
         self._show_media()
         self._fill_tree()
         self._set_busy(False)
@@ -1316,7 +1338,7 @@ class MainWindow(QMainWindow):
                 note += "（%d 个文件）" % p.count
             item = FileItem(parent, [p.name, "" if p.src is None else B.human_size(p.bytes),
                                      B.format_mtime(p.mtime), note])
-            item.setIcon(0, QIcon(self._icon(p.dst, p.is_dir, p.src).pixmap(16, QIcon.Disabled)))
+            item.setIcon(0, faded_icon(self._icon(p.dst, p.is_dir, p.src)))
             item.setData(0, ROLE_PATH, p.dst)
             item.setData(0, ROLE_KIND, KIND_PENDING)
             item.setData(0, ROLE_PENDING, i)
